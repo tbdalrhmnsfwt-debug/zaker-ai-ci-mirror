@@ -14,8 +14,9 @@
 library;
 
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Offset, Rect;
+import 'dart:ui' show Offset, Rect, Size;
 
 import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
 
@@ -27,6 +28,24 @@ const String pdfStudioFormat = 'zaker.pdf-studio';
 const int pdfStudioVersion = 1;
 const String projectManifestName = 'manifest.json';
 const String projectSourceName = 'source.pdf';
+
+/// The paper patterns the notebook generator can draw.
+enum PdfNotebookStyle {
+  /// Horizontal study lines.
+  ruled,
+
+  /// A square maths grid.
+  grid,
+
+  /// An empty white page.
+  plain;
+
+  String get labelAr => switch (this) {
+        ruled => 'مسطرة دراسية',
+        grid => 'مربعات رياضية',
+        plain => 'صفحة بيضاء',
+      };
+}
 
 /// A project package read back from disk.
 class PdfStudioProject {
@@ -168,6 +187,75 @@ class PdfExportManager {
     );
   }
 
+  /// Builds a standalone notebook PDF: one A4 page per [pageCount], each with
+  /// ruled, squared or plain paper.
+  ///
+  /// The result is a real PDF, so the reader's pen, highlighter, eraser, text
+  /// overlay and export work on it exactly as they do on an imported document.
+  Uint8List buildNotebookPdf({
+    PdfNotebookStyle style = PdfNotebookStyle.ruled,
+    int pageCount = 1,
+  }) {
+    final count = pageCount.clamp(1, 50);
+    final document = sf.PdfDocument();
+    try {
+      document.pageSettings.margins.all = 0;
+      for (var index = 0; index < count; index++) {
+        final page = document.pages.add();
+        _paintNotebook(page, style);
+      }
+      return Uint8List.fromList(document.saveSync());
+    } finally {
+      document.dispose();
+    }
+  }
+
+  void _paintNotebook(sf.PdfPage page, PdfNotebookStyle style) {
+    final size = page.size;
+    final graphics = page.graphics;
+    final line = sf.PdfPen(
+      sf.PdfColor(209, 222, 242),
+      width: 0.7,
+    );
+    const inset = 26.0;
+    switch (style) {
+      case PdfNotebookStyle.plain:
+        break;
+      case PdfNotebookStyle.ruled:
+        const spacing = 26.0;
+        for (var y = inset + spacing; y < size.height - inset; y += spacing) {
+          graphics.drawLine(
+            line,
+            Offset(inset, y),
+            Offset(size.width - inset, y),
+          );
+        }
+        // A notebook margin line, on the right for a right-to-left page.
+        final margin = sf.PdfPen(sf.PdfColor(224, 115, 128), width: 1);
+        graphics.drawLine(
+          margin,
+          Offset(size.width - inset - 30, inset),
+          Offset(size.width - inset - 30, size.height - inset),
+        );
+      case PdfNotebookStyle.grid:
+        const spacing = 22.0;
+        for (var y = inset + spacing; y < size.height - inset; y += spacing) {
+          graphics.drawLine(
+            line,
+            Offset(inset, y),
+            Offset(size.width - inset, y),
+          );
+        }
+        for (var x = inset + spacing; x < size.width - inset; x += spacing) {
+          graphics.drawLine(
+            line,
+            Offset(x, inset),
+            Offset(x, size.height - inset),
+          );
+        }
+    }
+  }
+
   /// Reads a package written by [buildProjectPackage].
   PdfStudioProject readProjectPackage(Uint8List bytes) {
     final Map<String, Uint8List> archive;
@@ -286,7 +374,7 @@ class PdfExportManager {
           Offset(bounds.right, middle),
         );
       case PdfAnnotationKind.ink:
-        _drawInk(graphics, color, bounds);
+        _drawInk(graphics, annotation, color, bounds, size);
       case PdfAnnotationKind.note:
         _drawCard(
           graphics,
@@ -304,8 +392,11 @@ class PdfExportManager {
           fill: 0xFFF2F6FF,
           stroke: 0xFF9FB1D1,
           text: annotation.text,
-          textColor: 0xFF08152E,
+          textColor: annotation.effectiveColor | 0xFF000000,
           fonts: fonts,
+          fontSize:
+              (annotation.effectiveFontScale * size.height).clamp(6.0, 48.0),
+          align: annotation.textAlign,
         );
       case PdfAnnotationKind.image:
         final bytes = mediaById[annotation.id];
@@ -349,21 +440,29 @@ class PdfExportManager {
           bold: true,
         );
       case PdfAnnotationKind.arrow:
-        final start = Offset(bounds.left, bounds.bottom);
-        final end = Offset(bounds.right, bounds.top);
+        final startPoint = annotation.startPoint;
+        final endPoint = annotation.endPoint;
+        final start = startPoint == null
+            ? Offset(bounds.left, bounds.bottom)
+            : Offset(startPoint.x * size.width, startPoint.y * size.height);
+        final end = endPoint == null
+            ? Offset(bounds.right, bounds.top)
+            : Offset(endPoint.x * size.width, endPoint.y * size.height);
+        _drawArrow(graphics, start, end, _color(color));
+      case PdfAnnotationKind.shape:
         final pen = sf.PdfPen(_color(color), width: 2);
-        graphics.drawLine(pen, start, end);
-        final length = 10.0;
-        graphics.drawLine(
-          pen,
-          end,
-          Offset(end.dx - length, end.dy + length / 2),
-        );
-        graphics.drawLine(
-          pen,
-          end,
-          Offset(end.dx - length / 2, end.dy + length),
-        );
+        switch (annotation.shape) {
+          case PdfShapeKind.rectangle:
+            graphics.drawRectangle(pen: pen, bounds: bounds);
+          case PdfShapeKind.ellipse:
+            graphics.drawEllipse(bounds, pen: pen);
+          case PdfShapeKind.line:
+            graphics.drawLine(
+              pen,
+              Offset(bounds.left, bounds.bottom),
+              Offset(bounds.right, bounds.top),
+            );
+        }
       case PdfAnnotationKind.audio:
       case PdfAnnotationKind.video:
         _drawCard(
@@ -383,8 +482,39 @@ class PdfExportManager {
     }
   }
 
-  void _drawInk(sf.PdfGraphics graphics, int color, Rect bounds) {
-    final pen = sf.PdfPen(_color(color), width: 2);
+  void _drawInk(
+    sf.PdfGraphics graphics,
+    PdfAnnotation annotation,
+    int color,
+    Rect bounds,
+    Size pageSize,
+  ) {
+    final width = (annotation.effectiveStrokeWidth * pageSize.width)
+        .clamp(0.8, 24.0)
+        .toDouble();
+    final pen = sf.PdfPen(_color(color), width: width)
+      ..lineCap = sf.PdfLineCap.round
+      ..lineJoin = sf.PdfLineJoin.round;
+    final points = annotation.points;
+    if (points.length >= 2) {
+      // One polyline, so a long stroke exports as a path rather than dozens
+      // of independent segments.
+      final path = sf.PdfPath();
+      path.addLine(
+        Offset(
+            points.first.x * pageSize.width, points.first.y * pageSize.height),
+        Offset(points[1].x * pageSize.width, points[1].y * pageSize.height),
+      );
+      for (var i = 2; i < points.length; i++) {
+        path.addLine(
+          Offset(points[i - 1].x * pageSize.width,
+              points[i - 1].y * pageSize.height),
+          Offset(points[i].x * pageSize.width, points[i].y * pageSize.height),
+        );
+      }
+      graphics.drawPath(path, pen: pen);
+      return;
+    }
     final steps = 14;
     var previous = Offset(bounds.left, bounds.top + bounds.height * 0.7);
     for (var i = 1; i <= steps; i++) {
@@ -398,6 +528,38 @@ class PdfExportManager {
     }
   }
 
+  void _drawArrow(
+    sf.PdfGraphics graphics,
+    Offset start,
+    Offset end,
+    sf.PdfColor color,
+  ) {
+    final pen = sf.PdfPen(color, width: 2)..lineCap = sf.PdfLineCap.round;
+    graphics.drawLine(pen, start, end);
+    final angle = math.atan2(end.dy - start.dy, end.dx - start.dx);
+    final length =
+        math.min(16.0, (end - start).distance * 0.4).clamp(4.0, 16.0);
+    final spread = math.pi * 0.82;
+    graphics.drawLine(
+      pen,
+      end,
+      end +
+          Offset(
+            math.cos(angle + spread) * length,
+            math.sin(angle + spread) * length,
+          ),
+    );
+    graphics.drawLine(
+      pen,
+      end,
+      end +
+          Offset(
+            math.cos(angle - spread) * length,
+            math.sin(angle - spread) * length,
+          ),
+    );
+  }
+
   void _drawCard(
     sf.PdfGraphics graphics,
     Rect bounds, {
@@ -407,6 +569,8 @@ class PdfExportManager {
     required int textColor,
     required _Fonts fonts,
     bool leadingDot = false,
+    double? fontSize,
+    PdfTextAlign? align,
   }) {
     graphics.drawRectangle(
       brush: sf.PdfSolidBrush(_color(fill)),
@@ -447,6 +611,8 @@ class PdfExportManager {
       _color(textColor),
       fonts,
       bold: true,
+      fontSize: fontSize,
+      align: align,
     );
   }
 
@@ -458,21 +624,30 @@ class PdfExportManager {
     _Fonts fonts, {
     bool center = false,
     bool bold = false,
+    double? fontSize,
+    PdfTextAlign? align,
   }) {
     if (text.trim().isEmpty) return;
-    final size = (bounds.height * 0.42).clamp(6.0, 15.0).toDouble();
+    final size = (fontSize ?? (bounds.height * 0.42).clamp(6.0, 15.0))
+        .clamp(6.0, 48.0)
+        .toDouble();
     final font = fonts.font(size, bold: bold);
     if (font == null) return;
     final rtl = _isArabic(text);
+    final alignment = switch (align) {
+      PdfTextAlign.left => sf.PdfTextAlignment.left,
+      PdfTextAlign.right => sf.PdfTextAlignment.right,
+      PdfTextAlign.center => sf.PdfTextAlignment.center,
+      null =>
+        center || rtl ? sf.PdfTextAlignment.center : sf.PdfTextAlignment.left,
+    };
     graphics.drawString(
       text,
       font,
       brush: sf.PdfSolidBrush(color),
       bounds: bounds,
       format: sf.PdfStringFormat(
-        alignment: center || rtl
-            ? sf.PdfTextAlignment.center
-            : sf.PdfTextAlignment.left,
+        alignment: alignment,
         textDirection: rtl
             ? sf.PdfTextDirection.rightToLeft
             : sf.PdfTextDirection.leftToRight,

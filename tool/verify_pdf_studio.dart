@@ -54,6 +54,11 @@ PdfAnnotation annotation({
   String mediaName = '',
   int mediaBytes = 0,
   int durationMs = 0,
+  List<PdfPoint> points = const [],
+  double strokeWidth = 0,
+  double fontScale = 0,
+  PdfTextAlign textAlign = PdfTextAlign.center,
+  PdfShapeKind shape = PdfShapeKind.rectangle,
   DateTime? createdAt,
 }) {
   return PdfAnnotation(
@@ -68,6 +73,11 @@ PdfAnnotation annotation({
     mediaName: mediaName,
     mediaBytes: mediaBytes,
     durationMs: durationMs,
+    points: points,
+    strokeWidth: strokeWidth,
+    fontScale: fontScale,
+    textAlign: textAlign,
+    shape: shape,
     createdAt: createdAt ?? DateTime.utc(2026, 10, 30, 12),
   );
 }
@@ -88,6 +98,13 @@ bool _sameAnnotation(PdfAnnotation a, PdfAnnotation b) {
       a.mediaName == b.mediaName &&
       a.mediaBytes == b.mediaBytes &&
       a.durationMs == b.durationMs &&
+      a.points.length == b.points.length &&
+      List.generate(a.points.length, (i) => a.points[i] == b.points[i])
+          .every((same) => same) &&
+      (a.strokeWidth - b.strokeWidth).abs() < 1e-9 &&
+      (a.fontScale - b.fontScale).abs() < 1e-9 &&
+      a.textAlign == b.textAlign &&
+      a.shape == b.shape &&
       a.createdAt.toUtc() == b.createdAt.toUtc();
 }
 
@@ -95,6 +112,7 @@ void main() {
   _annotationJson();
   _annotationDefaults();
   _annotationSafety();
+  _annotationDrawing();
   _annotationCodec();
   _zipRoundTrip();
   _zipRejects();
@@ -275,6 +293,119 @@ void _annotationSafety() {
       }),
     ),
     'a rectangle without four values is rejected',
+  );
+}
+
+void _annotationDrawing() {
+  check(
+    annotation().effectiveStrokeWidth == 0.004,
+    'a stroke width of zero means the default pen',
+  );
+  check(
+    annotation().effectiveFontScale == 0.022,
+    'a font scale of zero means the default text size',
+  );
+
+  final points = const [
+    PdfPoint(0.2, 0.3),
+    PdfPoint(0.4, 0.35),
+    PdfPoint(0.45, 0.5),
+  ];
+  final bounds = pdfBoundsOfPoints(points, padding: 0.01);
+  check(bounds != null, 'a stroke produces bounds');
+  checkClose(bounds!.left, 0.19, 'stroke bounds pad the left edge');
+  checkClose(bounds.top, 0.29, 'stroke bounds pad the top edge');
+  checkClose(bounds.right, 0.46, 'stroke bounds pad the right edge');
+  checkClose(bounds.bottom, 0.51, 'stroke bounds pad the bottom edge');
+  check(pdfBoundsOfPoints(const []) == null, 'an empty stroke has no bounds');
+
+  final clamped = pdfBoundsOfPoints(
+    const [PdfPoint(-0.2, -0.3), PdfPoint(1.4, 1.6)],
+  );
+  check(
+    clamped != null &&
+        clamped.left == 0 &&
+        clamped.top == 0 &&
+        clamped.right == 1 &&
+        clamped.bottom == 1,
+    'stroke bounds stay inside the page',
+  );
+
+  final ink = annotation(
+    kind: PdfAnnotationKind.ink,
+    points: points,
+    strokeWidth: 0.006,
+    rect: const NormalizedRect(0.19, 0.29, 0.27, 0.22),
+  );
+  checkClose(ink.effectiveStrokeWidth, 0.006, 'a custom pen width wins');
+  check(ink.startPoint == points.first, 'the first point starts the stroke');
+  check(ink.endPoint == points.last, 'the last point ends the stroke');
+  final inkJson = ink.toJson();
+  final inkRound = PdfAnnotation.fromJson(inkJson);
+  check(inkRound.points.length == 3, 'an ink path keeps every point');
+  check(inkRound.points[1] == points[1], 'ink points keep their coordinates');
+  checkClose(inkRound.strokeWidth, 0.006, 'ink keeps its pen width');
+
+  final label = annotation(
+    kind: PdfAnnotationKind.text,
+    fontScale: 0.034,
+    textAlign: PdfTextAlign.right,
+    color: 0xFF2E9E5B,
+  );
+  final labelRound = PdfAnnotation.fromJson(label.toJson());
+  checkClose(labelRound.fontScale, 0.034, 'text keeps its font scale');
+  check(
+    labelRound.textAlign == PdfTextAlign.right,
+    'text keeps its alignment',
+  );
+  check(labelRound.effectiveColor == 0xFF2E9E5B, 'text keeps its colour');
+
+  final shape = annotation(
+    kind: PdfAnnotationKind.shape,
+    shape: PdfShapeKind.ellipse,
+  );
+  final shapeRound = PdfAnnotation.fromJson(shape.toJson());
+  check(shapeRound.shape == PdfShapeKind.ellipse, 'a shape keeps its geometry');
+  check(
+    PdfAnnotation.fromJson(annotation().toJson()).shape ==
+        PdfShapeKind.rectangle,
+    'a plain annotation defaults to a rectangle',
+  );
+
+  final hostile = PdfAnnotation.fromJson({
+    'id': 'hostile',
+    'page': 0,
+    'kind': 'ink',
+    'rect': [0, 0, 0.2, 0.2],
+    'points': [
+      [-1, -1],
+      [2, 2],
+      ['bad', 0.5],
+      [0.5],
+    ],
+    'strokeWidth': 9,
+    'fontScale': 9,
+    'align': 'diagonal',
+    'shape': 'triangle',
+    'createdAt': '2026-10-30T12:00:00.000Z',
+  });
+  check(
+    hostile.points.length == 2,
+    'a hostile path drops malformed points instead of failing',
+  );
+  check(
+    hostile.points.every((p) => p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1),
+    'hostile points are clamped to the page',
+  );
+  checkClose(hostile.strokeWidth, 0.08, 'a pen width above the cap is clamped');
+  checkClose(hostile.fontScale, 0.25, 'a font scale above the cap is clamped');
+  check(
+    hostile.textAlign == PdfTextAlign.center,
+    'an unknown alignment falls back to centre',
+  );
+  check(
+    hostile.shape == PdfShapeKind.rectangle,
+    'an unknown shape falls back to a rectangle',
   );
 }
 

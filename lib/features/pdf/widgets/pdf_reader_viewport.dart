@@ -54,6 +54,18 @@ class PdfReaderViewport extends ConsumerStatefulWidget {
     this.annotations = const [],
     this.onPageLongPress,
     this.onAnnotationTap,
+    this.pageTool = PdfPageTool.none,
+    this.toolColor = 0xFF4779FF,
+    this.toolOpacity = 1,
+    this.toolStrokeWidth = 0.004,
+    this.eraserRadius = 0.02,
+    this.toolShape = PdfShapeKind.rectangle,
+    this.onStrokeEnd,
+    this.onRectDrag,
+    this.onTapPoint,
+    this.onErasePoint,
+    this.onEraseStart,
+    this.onEraseEnd,
   });
 
   final PdfRendererHandle handle;
@@ -97,6 +109,29 @@ class PdfReaderViewport extends ConsumerStatefulWidget {
 
   /// A tap on a sticky note, media card or image.
   final ValueChanged<PdfAnnotation>? onAnnotationTap;
+
+  /// The active drawing tool, applied to every page.
+  final PdfPageTool pageTool;
+  final int toolColor;
+  final double toolOpacity;
+  final double toolStrokeWidth;
+  final double eraserRadius;
+  final PdfShapeKind toolShape;
+
+  /// A finished freehand stroke on [pageIndex].
+  final void Function(int pageIndex, List<PdfPoint> points)? onStrokeEnd;
+
+  /// A finished arrow/shape drag on [pageIndex].
+  final void Function(int pageIndex, PdfPoint start, PdfPoint end)? onRectDrag;
+
+  /// A tap on [pageIndex] while a tap tool is active.
+  final void Function(int pageIndex, PdfPoint point)? onTapPoint;
+
+  /// One eraser sample on [pageIndex].
+  final void Function(int pageIndex, PdfPoint point)? onErasePoint;
+
+  final ValueChanged<int>? onEraseStart;
+  final ValueChanged<int>? onEraseEnd;
 
   @override
   PdfReaderViewportState createState() => PdfReaderViewportState();
@@ -357,6 +392,29 @@ class PdfReaderViewportState extends ConsumerState<PdfReaderViewport>
             ? null
             : (point) => widget.onPageLongPress!(index, point),
         onAnnotationTap: widget.onAnnotationTap,
+        tool: widget.pageTool,
+        toolColor: widget.toolColor,
+        toolOpacity: widget.toolOpacity,
+        toolStrokeWidth: widget.toolStrokeWidth,
+        eraserRadius: widget.eraserRadius,
+        shape: widget.toolShape,
+        onStrokeEnd: widget.onStrokeEnd == null
+            ? null
+            : (points) => widget.onStrokeEnd!(index, points),
+        onRectDrag: widget.onRectDrag == null
+            ? null
+            : (start, end) => widget.onRectDrag!(index, start, end),
+        onTapPoint: widget.onTapPoint == null
+            ? null
+            : (point) => widget.onTapPoint!(index, point),
+        onErasePoint: widget.onErasePoint == null
+            ? null
+            : (point) => widget.onErasePoint!(index, point),
+        onEraseStart: widget.onEraseStart == null
+            ? null
+            : () => widget.onEraseStart!(index),
+        onEraseEnd:
+            widget.onEraseEnd == null ? null : () => widget.onEraseEnd!(index),
       ),
     );
   }

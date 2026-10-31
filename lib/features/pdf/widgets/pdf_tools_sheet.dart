@@ -17,11 +17,14 @@ enum PdfStudioAction {
   text,
   image,
   stamp,
+  stampPicker,
   note,
   arrow,
   audio,
   video,
   pages,
+  notebook,
+  clearPage,
   compress,
   merge,
   split,
@@ -45,22 +48,86 @@ Future<void> showPdfToolsSheet(
   required double highlightOpacity,
   required ValueChanged<int> onHighlightColor,
   required ValueChanged<double> onHighlightOpacity,
+  required bool eraserActive,
+  required bool eraserObjectMode,
+  required int eraserSize,
+  required ValueChanged<bool> onEraser,
+  required ValueChanged<bool> onEraserObjectMode,
+  required ValueChanged<int> onEraserSize,
+  required PdfShapeKind shape,
+  required ValueChanged<PdfShapeKind> onShape,
 }) {
   return PdfStudioTheme.showSheet<void>(
     context: context,
-    builder: (context) => PdfToolsSheet(
-      activeKind: activeKind,
-      onKind: onKind,
-      onAction: onAction,
-      canUndo: canUndo,
-      canRedo: canRedo,
-      onUndo: onUndo,
-      onRedo: onRedo,
-      highlightColor: highlightColor,
-      highlightOpacity: highlightOpacity,
-      onHighlightColor: onHighlightColor,
-      onHighlightOpacity: onHighlightOpacity,
-    ),
+    // The sheet is its own route: reader state changes do not rebuild it, so
+    // the toggles that stay open (eraser, shape, marker colour) mirror their
+    // value locally and repaint through this builder.
+    builder: (sheetContext) {
+      var currentKind = activeKind;
+      var markerColor = highlightColor;
+      var markerOpacity = highlightOpacity;
+      var eraserOn = eraserActive;
+      var objectOnly = eraserObjectMode;
+      var radiusStep = eraserSize;
+      var currentShape = shape;
+      return StatefulBuilder(
+        builder: (context, setSheetState) => PdfToolsSheet(
+          activeKind: currentKind,
+          onKind: (kind) {
+            currentKind = kind;
+            onKind(kind);
+            setSheetState(() {});
+          },
+          onAction: onAction,
+          canUndo: canUndo,
+          canRedo: canRedo,
+          onUndo: onUndo,
+          onRedo: onRedo,
+          highlightColor: markerColor,
+          highlightOpacity: markerOpacity,
+          onHighlightColor: (value) {
+            markerColor = value;
+            onHighlightColor(value);
+            setSheetState(() {});
+          },
+          onHighlightOpacity: (value) {
+            markerOpacity = value;
+            onHighlightOpacity(value);
+            setSheetState(() {});
+          },
+          eraserActive: eraserOn,
+          eraserObjectMode: objectOnly,
+          eraserSize: radiusStep,
+          onEraser: (value) {
+            eraserOn = value;
+            if (value) {
+              currentKind = null;
+            } else {
+              objectOnly = false;
+            }
+            onEraser(value);
+            setSheetState(() {});
+          },
+          onEraserObjectMode: (value) {
+            objectOnly = value;
+            if (value) eraserOn = true;
+            onEraserObjectMode(value);
+            setSheetState(() {});
+          },
+          onEraserSize: (value) {
+            radiusStep = value;
+            onEraserSize(value);
+            setSheetState(() {});
+          },
+          shape: currentShape,
+          onShape: (value) {
+            currentShape = value;
+            onShape(value);
+            setSheetState(() {});
+          },
+        ),
+      );
+    },
   );
 }
 
@@ -79,6 +146,14 @@ class PdfToolsSheet extends StatelessWidget {
     required this.highlightOpacity,
     required this.onHighlightColor,
     required this.onHighlightOpacity,
+    required this.eraserActive,
+    required this.eraserObjectMode,
+    required this.eraserSize,
+    required this.onEraser,
+    required this.onEraserObjectMode,
+    required this.onEraserSize,
+    required this.shape,
+    required this.onShape,
   });
 
   final PdfAnnotationKind? activeKind;
@@ -92,6 +167,22 @@ class PdfToolsSheet extends StatelessWidget {
   final double highlightOpacity;
   final ValueChanged<int> onHighlightColor;
   final ValueChanged<double> onHighlightOpacity;
+
+  /// Whether the eraser tool is the active tool.
+  final bool eraserActive;
+
+  /// Object mode removes whole annotations; stroke mode erases what it crosses.
+  final bool eraserObjectMode;
+
+  /// 0 = small, 1 = medium, 2 = large.
+  final int eraserSize;
+  final ValueChanged<bool> onEraser;
+  final ValueChanged<bool> onEraserObjectMode;
+  final ValueChanged<int> onEraserSize;
+
+  /// The geometry the shape tool draws.
+  final PdfShapeKind shape;
+  final ValueChanged<PdfShapeKind> onShape;
 
   void _pick(BuildContext context, PdfAnnotationKind kind) {
     onKind(activeKind == kind ? null : kind);
@@ -198,6 +289,17 @@ class PdfToolsSheet extends StatelessWidget {
                         onTap: () =>
                             _pick(context, PdfAnnotationKind.highlight),
                       ),
+                      _ToolTile(
+                        label: 'ممحاة',
+                        icon: Icons.auto_fix_normal_rounded,
+                        selected: eraserActive,
+                        onTap: () => onEraser(!eraserActive),
+                      ),
+                      _ToolTile(
+                        label: 'مسح تعليقات الصفحة',
+                        icon: Icons.delete_sweep_rounded,
+                        onTap: () => _act(context, PdfStudioAction.clearPage),
+                      ),
                     ],
                   ),
                   if (activeKind == PdfAnnotationKind.highlight) ...[
@@ -207,6 +309,15 @@ class PdfToolsSheet extends StatelessWidget {
                       opacity: highlightOpacity,
                       onColor: onHighlightColor,
                       onOpacity: onHighlightOpacity,
+                    ),
+                  ],
+                  if (eraserActive) ...[
+                    const SizedBox(height: 14),
+                    _EraserOptions(
+                      objectMode: eraserObjectMode,
+                      size: eraserSize,
+                      onObjectMode: onEraserObjectMode,
+                      onSize: onEraserSize,
                     ),
                   ],
                   const SizedBox(height: 20),
@@ -220,8 +331,8 @@ class PdfToolsSheet extends StatelessWidget {
                       _ToolTile(
                         label: 'أشكال',
                         icon: Icons.change_history_rounded,
-                        selected: activeKind == PdfAnnotationKind.arrow,
-                        onTap: () => _pick(context, PdfAnnotationKind.arrow),
+                        selected: activeKind == PdfAnnotationKind.shape,
+                        onTap: () => _pick(context, PdfAnnotationKind.shape),
                       ),
                       _ToolTile(
                         label: 'حجم الخط',
@@ -240,6 +351,10 @@ class PdfToolsSheet extends StatelessWidget {
                       ),
                     ],
                   ),
+                  if (activeKind == PdfAnnotationKind.shape) ...[
+                    const SizedBox(height: 14),
+                    _ShapeOptions(shape: shape, onShape: onShape),
+                  ],
                   const SizedBox(height: 20),
                   const _SectionTitle(
                     title: 'إضافات متقدمة',
@@ -257,7 +372,7 @@ class PdfToolsSheet extends StatelessWidget {
                         label: 'ملصق/ختم',
                         icon: Icons.verified_outlined,
                         selected: activeKind == PdfAnnotationKind.stamp,
-                        onTap: () => _pick(context, PdfAnnotationKind.stamp),
+                        onTap: () => _act(context, PdfStudioAction.stampPicker),
                       ),
                       _ToolTile(
                         label: 'ملاحظة لاصقة',
@@ -285,6 +400,11 @@ class PdfToolsSheet extends StatelessWidget {
                         label: 'تنظيم الصفحات',
                         icon: Icons.view_carousel_outlined,
                         onTap: () => _act(context, PdfStudioAction.pages),
+                      ),
+                      _ToolTile(
+                        label: 'صفحة بيضاء مسطرة',
+                        icon: Icons.menu_book_outlined,
+                        onTap: () => _act(context, PdfStudioAction.notebook),
                       ),
                       _ToolTile(
                         label: 'ضغط PDF',
@@ -556,6 +676,184 @@ class _HighlightOptions extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Eraser mode and radius, shown while the eraser is the active tool.
+class _EraserOptions extends StatelessWidget {
+  const _EraserOptions({
+    required this.objectMode,
+    required this.size,
+    required this.onObjectMode,
+    required this.onSize,
+  });
+
+  final bool objectMode;
+  final int size;
+  final ValueChanged<bool> onObjectMode;
+  final ValueChanged<int> onSize;
+
+  static const List<String> _sizes = ['صغيرة', 'متوسطة', 'كبيرة'];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsetsDirectional.fromSTEB(14, 10, 14, 10),
+      decoration: BoxDecoration(
+        color: PdfStudioColors.surfaceAlt,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: PdfStudioColors.stroke),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const TrText(
+                'نوع الممحاة',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: PdfStudioColors.muted,
+                ),
+              ),
+              const Spacer(),
+              _OptionChip(
+                label: 'نقاط',
+                selected: !objectMode,
+                onTap: () => onObjectMode(false),
+              ),
+              const SizedBox(width: 6),
+              _OptionChip(
+                label: 'كائنات',
+                selected: objectMode,
+                onTap: () => onObjectMode(true),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              const TrText(
+                'حجم الممحاة',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: PdfStudioColors.muted,
+                ),
+              ),
+              const Spacer(),
+              for (var index = 0; index < _sizes.length; index++) ...[
+                _OptionChip(
+                  label: _sizes[index],
+                  selected: size == index,
+                  onTap: () => onSize(index),
+                ),
+                if (index != _sizes.length - 1) const SizedBox(width: 6),
+              ],
+            ],
+          ),
+          const SizedBox(height: 8),
+          const TrText(
+            'اسحب على الخط أو الرسم لمحوه، والتراجع يرجّعه.',
+            style: TextStyle(fontSize: 10.5, color: PdfStudioColors.muted),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Rectangle / ellipse / line choice for the shape tool.
+class _ShapeOptions extends StatelessWidget {
+  const _ShapeOptions({required this.shape, required this.onShape});
+
+  final PdfShapeKind shape;
+  final ValueChanged<PdfShapeKind> onShape;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsetsDirectional.fromSTEB(14, 8, 14, 8),
+      decoration: BoxDecoration(
+        color: PdfStudioColors.surfaceAlt,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: PdfStudioColors.stroke),
+      ),
+      child: Row(
+        children: [
+          const TrText(
+            'الشكل',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: PdfStudioColors.muted,
+            ),
+          ),
+          const Spacer(),
+          _OptionChip(
+            label: 'مستطيل',
+            selected: shape == PdfShapeKind.rectangle,
+            onTap: () => onShape(PdfShapeKind.rectangle),
+          ),
+          const SizedBox(width: 6),
+          _OptionChip(
+            label: 'دائرة',
+            selected: shape == PdfShapeKind.ellipse,
+            onTap: () => onShape(PdfShapeKind.ellipse),
+          ),
+          const SizedBox(width: 6),
+          _OptionChip(
+            label: 'خط',
+            selected: shape == PdfShapeKind.line,
+            onTap: () => onShape(PdfShapeKind.line),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _OptionChip extends StatelessWidget {
+  const _OptionChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected
+          ? PdfStudioColors.blue.withValues(alpha: 0.22)
+          : PdfStudioColors.surface,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: selected ? PdfStudioColors.blue : PdfStudioColors.stroke,
+            ),
+          ),
+          child: TrText(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+              color:
+                  selected ? PdfStudioColors.blueText : PdfStudioColors.muted,
+            ),
+          ),
+        ),
       ),
     );
   }

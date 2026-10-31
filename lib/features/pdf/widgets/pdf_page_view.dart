@@ -10,14 +10,46 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../../../core/pdf/pdf_annotations.dart';
 import '../../../core/pdf/pdf_page_geometry.dart';
 
-/// A single page at [zoom], with night mode, rotation, search hits and the
-/// studio's annotations.
-class PdfPageView extends StatelessWidget {
+/// What a touch on the page does while a studio tool is active.
+enum PdfPageTool {
+  none,
+  ink,
+  highlight,
+  underline,
+  strike,
+  arrow,
+  shape,
+  image,
+  eraseStroke,
+  eraseObject,
+  text,
+  stamp;
+
+  /// Tools that record a freehand path while the finger moves.
+  bool get isStroke =>
+      this == ink ||
+      this == highlight ||
+      this == underline ||
+      this == strike ||
+      this == eraseStroke;
+
+  /// Tools that turn one drag into a rectangle.
+  bool get isDragRect => this == arrow || this == shape || this == image;
+}
+
+/// A single page at [zoom], with night mode, rotation, search hits, the
+/// studio's annotations and, while a tool is active, the drawing layer.
+///
+/// The drawing layer owns the gesture arena for its page: an eager pan
+/// recognizer is installed only when a pen, marker, shape or eraser tool is
+/// active, so normal scrolling and pinch-zoom keep working untouched.
+class PdfPageView extends StatefulWidget {
   const PdfPageView({
     super.key,
     required this.geometry,
@@ -31,6 +63,18 @@ class PdfPageView extends StatelessWidget {
     this.annotations = const [],
     this.onLongPress,
     this.onAnnotationTap,
+    this.tool = PdfPageTool.none,
+    this.toolColor = 0xFF4779FF,
+    this.toolOpacity = 1,
+    this.toolStrokeWidth = 0.004,
+    this.eraserRadius = 0.02,
+    this.shape = PdfShapeKind.rectangle,
+    this.onStrokeEnd,
+    this.onRectDrag,
+    this.onTapPoint,
+    this.onErasePoint,
+    this.onEraseStart,
+    this.onEraseEnd,
   });
 
   final PdfPageGeometry geometry;
@@ -57,12 +101,174 @@ class PdfPageView extends StatelessWidget {
   /// Opens the editor for a tapped annotation.
   final ValueChanged<PdfAnnotation>? onAnnotationTap;
 
+  /// The active studio tool; [PdfPageTool.none] keeps the page passive.
+  final PdfPageTool tool;
+
+  /// Colour of the in-progress stroke or shape (ARGB).
+  final int toolColor;
+
+  /// Opacity of the in-progress stroke (used by the highlighter).
+  final double toolOpacity;
+
+  /// Stroke width as a fraction of the page width.
+  final double toolStrokeWidth;
+
+  /// Eraser radius as a fraction of the page width.
+  final double eraserRadius;
+
+  /// The geometry the shape tool previews and inserts.
+  final PdfShapeKind shape;
+
+  /// A completed freehand path, in unrotated page coordinates.
+  final ValueChanged<List<PdfPoint>>? onStrokeEnd;
+
+  /// A completed drag for an arrow or shape.
+  final void Function(PdfPoint start, PdfPoint end)? onRectDrag;
+
+  /// A tap while the text, stamp or object-eraser tool is active.
+  final ValueChanged<PdfPoint>? onTapPoint;
+
+  /// One eraser sample while the finger drags.
+  final ValueChanged<PdfPoint>? onErasePoint;
+
+  /// The start of one eraser gesture; the reader snapshots undo here.
+  final VoidCallback? onEraseStart;
+
+  /// The end of one eraser gesture; the reader commits one undo entry.
+  final VoidCallback? onEraseEnd;
+
+  @override
+  State<PdfPageView> createState() => _PdfPageViewState();
+}
+
+class _PdfPageViewState extends State<PdfPageView> {
+  final List<PdfPoint> _draft = [];
+  PdfPoint? _dragStart;
+  PdfPoint? _dragCurrent;
+  PdfPoint? _eraserPoint;
+  bool _erasing = false;
+
+  double _boxWidth = 1;
+  double _boxHeight = 1;
+
+  bool get _panTool => widget.tool.isStroke || widget.tool.isDragRect;
+
+  bool get _tapTool =>
+      widget.tool == PdfPageTool.text ||
+      widget.tool == PdfPageTool.stamp ||
+      widget.tool == PdfPageTool.eraseObject;
+
+  /// A pointer position inside the page box, mapped to the unrotated page.
+  PdfPoint _pagePoint(Offset local) {
+    if (_boxWidth <= 0 || _boxHeight <= 0) return const PdfPoint(0, 0);
+    final display = NormalizedRect(
+      (local.dx / _boxWidth).clamp(0.0, 1.0).toDouble(),
+      (local.dy / _boxHeight).clamp(0.0, 1.0).toDouble(),
+      0,
+      0,
+    );
+    final unrotated = PdfPageGeometry.unrotateSource(
+      display,
+      widget.quarterTurns,
+    );
+    return PdfPoint(unrotated.left, unrotated.top);
+  }
+
+  void _onPanStart(DragStartDetails details) {
+    final point = _pagePoint(details.localPosition);
+    setState(() {
+      _draft
+        ..clear()
+        ..add(point);
+      _dragStart = widget.tool.isDragRect ? point : null;
+      _dragCurrent = _dragStart;
+      _eraserPoint = widget.tool == PdfPageTool.eraseStroke ? point : null;
+      _erasing = widget.tool == PdfPageTool.eraseStroke;
+    });
+    if (_erasing) {
+      widget.onEraseStart?.call();
+      widget.onErasePoint?.call(point);
+    }
+  }
+
+  void _onPanUpdate(DragUpdateDetails details) {
+    final point = _pagePoint(details.localPosition);
+    setState(() {
+      if (widget.tool.isDragRect) {
+        _dragCurrent = point;
+      } else {
+        final last = _draft.isEmpty ? null : _draft.last;
+        if (last == null ||
+            (point.x - last.x).abs() > 0.0008 ||
+            (point.y - last.y).abs() > 0.0008) {
+          _draft.add(point);
+        }
+        if (widget.tool == PdfPageTool.eraseStroke) _eraserPoint = point;
+      }
+    });
+    if (widget.tool == PdfPageTool.eraseStroke) {
+      widget.onErasePoint?.call(point);
+    }
+  }
+
+  void _onPanEnd(DragEndDetails details) {
+    final tool = widget.tool;
+    final points = List<PdfPoint>.of(_draft);
+    final start = _dragStart;
+    final end = _dragCurrent;
+    final erasing = _erasing;
+    setState(() {
+      _draft.clear();
+      _dragStart = null;
+      _dragCurrent = null;
+      _eraserPoint = null;
+      _erasing = false;
+    });
+    if (erasing) {
+      widget.onEraseEnd?.call();
+      return;
+    }
+    if (tool.isStroke && points.length >= 2) {
+      widget.onStrokeEnd?.call(points);
+      return;
+    }
+    if (tool.isDragRect &&
+        start != null &&
+        end != null &&
+        ((end.x - start.x).abs() > 0.004 || (end.y - start.y).abs() > 0.004)) {
+      widget.onRectDrag?.call(start, end);
+    }
+  }
+
+  void _onPanCancel() {
+    final erasing = _erasing;
+    setState(() {
+      _draft.clear();
+      _dragStart = null;
+      _dragCurrent = null;
+      _eraserPoint = null;
+      _erasing = false;
+    });
+    if (erasing) widget.onEraseEnd?.call();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final pageWidth = geometry.displayWidth(fitScale: fitScale, zoom: zoom);
-    final pageHeight = geometry.displayHeight(fitScale: fitScale, zoom: zoom);
-    final turns = ((quarterTurns % 4) + 4) % 4;
+    final pageWidth = widget.geometry
+        .displayWidth(fitScale: widget.fitScale, zoom: widget.zoom);
+    final pageHeight = widget.geometry
+        .displayHeight(fitScale: widget.fitScale, zoom: widget.zoom);
+    final turns = ((widget.quarterTurns % 4) + 4) % 4;
     final swapped = turns.isOdd;
+    final boxWidth = swapped ? pageHeight : pageWidth;
+    final boxHeight = swapped ? pageWidth : pageHeight;
+    _boxWidth = boxWidth;
+    _boxHeight = boxHeight;
+
+    final showDraft = _draft.length > 1 ||
+        _dragStart != null ||
+        _dragCurrent != null ||
+        _eraserPoint != null;
 
     final content = SizedBox(
       width: pageWidth,
@@ -71,15 +277,17 @@ class PdfPageView extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           const ColoredBox(color: Colors.white),
-          if (tile != null && source != null)
+          if (widget.tile != null && widget.source != null)
             Positioned(
-              left: source!.left * pageWidth,
-              top: source!.top * pageHeight,
-              width: source!.width * pageWidth,
-              height: source!.height * pageHeight,
-              child: nightMode ? _night(_tileImage(tile!)) : _tileImage(tile!),
+              left: widget.source!.left * pageWidth,
+              top: widget.source!.top * pageHeight,
+              width: widget.source!.width * pageWidth,
+              height: widget.source!.height * pageHeight,
+              child: widget.nightMode
+                  ? _night(_tileImage(widget.tile!))
+                  : _tileImage(widget.tile!),
             ),
-          for (final rect in highlights)
+          for (final rect in widget.highlights)
             Positioned(
               left: rect.left * pageWidth,
               top: rect.top * pageHeight,
@@ -89,15 +297,34 @@ class PdfPageView extends StatelessWidget {
                 child: ColoredBox(color: Color(0x66FFC107)),
               ),
             ),
-          for (final annotation in annotations)
+          for (final annotation in widget.annotations)
             _positionedAnnotation(annotation, pageWidth, pageHeight),
+          if (showDraft)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _DraftPainter(
+                    tool: widget.tool,
+                    points: _draft,
+                    dragStart: _dragStart,
+                    dragCurrent: _dragCurrent,
+                    color: Color(widget.toolColor | 0xFF000000),
+                    opacity: widget.toolOpacity.clamp(0.05, 1.0),
+                    strokeWidth: widget.toolStrokeWidth,
+                    eraserPoint: _eraserPoint,
+                    eraserRadius: widget.eraserRadius,
+                    shape: widget.shape,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
 
     final box = SizedBox(
-      width: swapped ? pageHeight : pageWidth,
-      height: swapped ? pageWidth : pageHeight,
+      width: boxWidth,
+      height: boxHeight,
       child: DecoratedBox(
         decoration: const BoxDecoration(
           border: Border.fromBorderSide(BorderSide(color: Colors.black12)),
@@ -115,23 +342,46 @@ class PdfPageView extends StatelessWidget {
       ),
     );
 
-    final onLongPress = this.onLongPress;
-    if (onLongPress == null) return box;
-    final boxWidth = swapped ? pageHeight : pageWidth;
-    final boxHeight = swapped ? pageWidth : pageHeight;
+    Widget page = box;
+    if (_panTool) {
+      // The page, not the scroll view, wins the arena while a pen or eraser is
+      // active: the recognizer accepts on pointer-down, so a drag draws instead
+      // of panning the document.
+      page = RawGestureDetector(
+        behavior: HitTestBehavior.opaque,
+        gestures: <Type, GestureRecognizerFactory>{
+          _EagerPanGestureRecognizer:
+              GestureRecognizerFactoryWithHandlers<_EagerPanGestureRecognizer>(
+            () => _EagerPanGestureRecognizer(),
+            (recognizer) {
+              recognizer
+                ..onStart = _onPanStart
+                ..onUpdate = _onPanUpdate
+                ..onEnd = _onPanEnd
+                ..onCancel = _onPanCancel;
+            },
+          ),
+        },
+        child: box,
+      );
+    } else if (_tapTool) {
+      page = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapUp: (details) =>
+            widget.onTapPoint?.call(_pagePoint(details.localPosition)),
+        child: box,
+      );
+    }
+
+    final onLongPress = widget.onLongPress;
+    if (onLongPress == null) return page;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onLongPressStart: (details) {
-        if (boxWidth <= 0 || boxHeight <= 0) return;
-        final point = NormalizedRect(
-          (details.localPosition.dx / boxWidth).clamp(0.0, 1.0).toDouble(),
-          (details.localPosition.dy / boxHeight).clamp(0.0, 1.0).toDouble(),
-          0,
-          0,
-        );
-        onLongPress(PdfPageGeometry.unrotateSource(point, turns));
+        final point = _pagePoint(details.localPosition);
+        onLongPress(NormalizedRect(point.x, point.y, 0, 0));
       },
-      child: box,
+      child: page,
     );
   }
 
@@ -195,6 +445,9 @@ class PdfPageView extends StatelessWidget {
             child: CustomPaint(
               painter: _InkPainter(
                 color.withValues(alpha: annotation.opacity),
+                points: annotation.points,
+                rect: rect,
+                strokeWidth: annotation.effectiveStrokeWidth,
               ),
             ),
           ),
@@ -245,12 +498,18 @@ class PdfPageView extends StatelessWidget {
           border: const Color(0xFFCBD5E1),
           child: Text(
             annotation.text,
-            maxLines: 5,
+            maxLines: 6,
             overflow: TextOverflow.ellipsis,
             textDirection: TextDirection.rtl,
+            textAlign: switch (annotation.textAlign) {
+              PdfTextAlign.left => TextAlign.left,
+              PdfTextAlign.center => TextAlign.center,
+              PdfTextAlign.right => TextAlign.right,
+            },
             style: TextStyle(
-              fontSize: 9,
-              height: 1.35,
+              fontSize:
+                  (annotation.effectiveFontScale * pageHeight).clamp(7.0, 48.0),
+              height: 1.3,
               fontWeight: FontWeight.w600,
               color: Color(annotation.effectiveColor | 0xFF000000),
             ),
@@ -287,7 +546,29 @@ class PdfPageView extends StatelessWidget {
           width: width,
           height: height,
           child: IgnorePointer(
-            child: CustomPaint(painter: _ArrowPainter(color)),
+            child: CustomPaint(
+              painter: _ArrowPainter(
+                color,
+                start: annotation.startPoint,
+                end: annotation.endPoint,
+                rect: rect,
+              ),
+            ),
+          ),
+        );
+      case PdfAnnotationKind.shape:
+        return Positioned(
+          left: left,
+          top: top,
+          width: width,
+          height: height,
+          child: IgnorePointer(
+            child: CustomPaint(
+              painter: _ShapePainter(
+                color.withValues(alpha: annotation.opacity),
+                annotation.shape,
+              ),
+            ),
           ),
         );
       case PdfAnnotationKind.audio:
@@ -321,8 +602,9 @@ class PdfPageView extends StatelessWidget {
       width: width,
       height: height,
       child: GestureDetector(
-        onTap:
-            onAnnotationTap == null ? null : () => onAnnotationTap!(annotation),
+        onTap: widget.onAnnotationTap == null
+            ? null
+            : () => widget.onAnnotationTap!(annotation),
         child: Material(
           color: Colors.transparent,
           child: Container(
@@ -391,8 +673,9 @@ class PdfPageView extends StatelessWidget {
       width: width,
       height: height,
       child: GestureDetector(
-        onTap:
-            onAnnotationTap == null ? null : () => onAnnotationTap!(annotation),
+        onTap: widget.onAnnotationTap == null
+            ? null
+            : () => widget.onAnnotationTap!(annotation),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(4),
           child: child,
@@ -515,20 +798,70 @@ String _size(int bytes) {
   return '$bytes B';
 }
 
+/// Accepts as soon as the pointer lands, so a pen stroke wins over the
+/// scroll view's drag recognizer instead of fighting it.
+class _EagerPanGestureRecognizer extends PanGestureRecognizer {
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    resolve(GestureDisposition.accepted);
+  }
+}
+
+/// Maps a page-normalized point into the local box of an annotation.
+Offset _localPoint(PdfPoint point, NormalizedRect rect, Size size) {
+  final width = math.max(rect.width, 0.0001);
+  final height = math.max(rect.height, 0.0001);
+  return Offset(
+    ((point.x - rect.left) / width).clamp(0.0, 1.0) * size.width,
+    ((point.y - rect.top) / height).clamp(0.0, 1.0) * size.height,
+  );
+}
+
 class _InkPainter extends CustomPainter {
-  const _InkPainter(this.color);
+  const _InkPainter(
+    this.color, {
+    this.points = const [],
+    this.rect,
+    this.strokeWidth = 0.004,
+  });
 
   final Color color;
+  final List<PdfPoint> points;
+  final NormalizedRect? rect;
+  final double strokeWidth;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final box = rect;
+    final path = Path();
+    if (points.length >= 2 && box != null && box.width > 0) {
+      // The stroke is stored in page coordinates; the box is the stroke's own
+      // bounds, so the width scales with the page, not with the screen.
+      final pageWidth = size.width / math.max(box.width, 0.0001);
+      path.moveTo(
+        _localPoint(points.first, box, size).dx,
+        _localPoint(points.first, box, size).dy,
+      );
+      for (var i = 1; i < points.length; i++) {
+        final local = _localPoint(points[i], box, size);
+        path.lineTo(local.dx, local.dy);
+      }
+      final paint = Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = math.max(1.1, strokeWidth * pageWidth)
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      canvas.drawPath(path, paint);
+      return;
+    }
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = math.max(1.4, size.height * 0.08)
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
-    final path = Path();
     const steps = 14;
     for (var i = 0; i <= steps; i++) {
       final t = i / steps;
@@ -544,46 +877,197 @@ class _InkPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_InkPainter oldDelegate) => oldDelegate.color != color;
+  bool shouldRepaint(_InkPainter oldDelegate) =>
+      oldDelegate.color != color ||
+      oldDelegate.points != points ||
+      oldDelegate.rect != rect;
 }
 
 class _ArrowPainter extends CustomPainter {
-  const _ArrowPainter(this.color);
+  const _ArrowPainter(
+    this.color, {
+    this.start,
+    this.end,
+    this.rect,
+  });
 
   final Color color;
+  final PdfPoint? start;
+  final PdfPoint? end;
+  final NormalizedRect? rect;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final box = rect;
+    final from = (start != null && box != null)
+        ? _localPoint(start!, box, size)
+        : Offset(size.width * 0.1, size.height * 0.9);
+    final to = (end != null && box != null)
+        ? _localPoint(end!, box, size)
+        : Offset(size.width * 0.9, size.height * 0.1);
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round;
+    _drawArrow(canvas, from, to, paint);
+  }
+
+  @override
+  bool shouldRepaint(_ArrowPainter oldDelegate) =>
+      oldDelegate.color != color ||
+      oldDelegate.start != start ||
+      oldDelegate.end != end;
+}
+
+/// Shared head maths for the arrow preview and the stored arrow.
+void _drawArrow(Canvas canvas, Offset start, Offset end, Paint paint) {
+  canvas.drawLine(start, end, paint);
+  final angle = math.atan2(end.dy - start.dy, end.dx - start.dx);
+  final length = math.min(14.0, (end - start).distance * 0.4).clamp(4.0, 14.0);
+  for (final spread in [math.pi * 0.82, -math.pi * 0.82]) {
+    canvas.drawLine(
+      end,
+      end +
+          Offset(
+            math.cos(angle + spread) * length,
+            math.sin(angle + spread) * length,
+          ),
+      paint,
+    );
+  }
+}
+
+class _ShapePainter extends CustomPainter {
+  const _ShapePainter(this.color, this.shape);
+
+  final Color color;
+  final PdfShapeKind shape;
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = math.max(1.4, size.height * 0.05)
-      ..strokeCap = StrokeCap.round;
-    final start = Offset(size.width * 0.1, size.height * 0.9);
-    final end = Offset(size.width * 0.9, size.height * 0.1);
-    canvas.drawLine(start, end, paint);
-    final angle = math.atan2(end.dy - start.dy, end.dx - start.dx);
-    const length = 12.0;
-    canvas.drawLine(
-      end,
-      end +
-          Offset(
-            math.cos(angle + math.pi * 0.82) * length,
-            math.sin(angle + math.pi * 0.82) * length,
-          ),
-      paint,
-    );
-    canvas.drawLine(
-      end,
-      end +
-          Offset(
-            math.cos(angle - math.pi * 0.82) * length,
-            math.sin(angle - math.pi * 0.82) * length,
-          ),
-      paint,
-    );
+      ..strokeWidth = 2;
+    switch (shape) {
+      case PdfShapeKind.rectangle:
+        canvas.drawRect(Offset.zero & size, paint);
+      case PdfShapeKind.ellipse:
+        canvas.drawOval(Offset.zero & size, paint);
+      case PdfShapeKind.line:
+        canvas.drawLine(
+          Offset(0, size.height),
+          Offset(size.width, 0),
+          paint,
+        );
+    }
   }
 
   @override
-  bool shouldRepaint(_ArrowPainter oldDelegate) => oldDelegate.color != color;
+  bool shouldRepaint(_ShapePainter oldDelegate) =>
+      oldDelegate.color != color || oldDelegate.shape != shape;
+}
+
+/// The in-progress stroke or drag, painted above the page until the finger
+/// lifts and the reader turns it into an annotation.
+class _DraftPainter extends CustomPainter {
+  const _DraftPainter({
+    required this.tool,
+    required this.points,
+    required this.color,
+    required this.opacity,
+    required this.strokeWidth,
+    required this.eraserRadius,
+    required this.shape,
+    this.dragStart,
+    this.dragCurrent,
+    this.eraserPoint,
+  });
+
+  final PdfPageTool tool;
+  final List<PdfPoint> points;
+  final PdfPoint? dragStart;
+  final PdfPoint? dragCurrent;
+  final Color color;
+  final double opacity;
+  final double strokeWidth;
+  final PdfPoint? eraserPoint;
+  final double eraserRadius;
+  final PdfShapeKind shape;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.length > 1 && !tool.isDragRect) {
+      final paint = Paint()
+        ..color = tool == PdfPageTool.highlight
+            ? color.withValues(alpha: opacity * 0.55)
+            : color.withValues(alpha: opacity)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = tool == PdfPageTool.highlight
+            ? math.max(6.0, strokeWidth * size.width * 3)
+            : math.max(1.4, strokeWidth * size.width)
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      final path = Path()
+        ..moveTo(points.first.x * size.width, points.first.y * size.height);
+      for (var i = 1; i < points.length; i++) {
+        path.lineTo(points[i].x * size.width, points[i].y * size.height);
+      }
+      canvas.drawPath(path, paint);
+    }
+
+    final start = dragStart;
+    final end = dragCurrent;
+    if (start != null && end != null) {
+      final from = Offset(start.x * size.width, start.y * size.height);
+      final to = Offset(end.x * size.width, end.y * size.height);
+      final paint = Paint()
+        ..color = color.withValues(alpha: opacity)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2;
+      if (tool == PdfPageTool.arrow) {
+        _drawArrow(canvas, from, to, paint);
+      } else if (tool == PdfPageTool.image) {
+        canvas.drawRect(Rect.fromPoints(from, to), paint);
+      } else {
+        final rect = Rect.fromPoints(from, to);
+        switch (shape) {
+          case PdfShapeKind.rectangle:
+            canvas.drawRect(rect, paint);
+          case PdfShapeKind.ellipse:
+            canvas.drawOval(rect, paint);
+          case PdfShapeKind.line:
+            canvas.drawLine(from, to, paint);
+        }
+      }
+    }
+
+    final eraser = eraserPoint;
+    if (eraser != null) {
+      final center = Offset(eraser.x * size.width, eraser.y * size.height);
+      final radius = math.max(3.0, eraserRadius * size.width);
+      canvas.drawCircle(
+        center,
+        radius,
+        Paint()..color = Colors.white.withValues(alpha: 0.55),
+      );
+      canvas.drawCircle(
+        center,
+        radius,
+        Paint()
+          ..color = color.withValues(alpha: 0.8)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_DraftPainter oldDelegate) =>
+      oldDelegate.points != points ||
+      oldDelegate.dragStart != dragStart ||
+      oldDelegate.dragCurrent != dragCurrent ||
+      oldDelegate.eraserPoint != eraserPoint ||
+      oldDelegate.color != color;
 }

@@ -351,6 +351,8 @@ class PdfStudioBottomChrome extends StatelessWidget {
     required this.onPages,
     required this.onUndo,
     required this.onRedo,
+    this.eraserActive = false,
+    this.onEraser,
   });
 
   final int page;
@@ -363,6 +365,8 @@ class PdfStudioBottomChrome extends StatelessWidget {
   final VoidCallback onPages;
   final VoidCallback onUndo;
   final VoidCallback onRedo;
+  final bool eraserActive;
+  final VoidCallback? onEraser;
 
   @override
   Widget build(BuildContext context) {
@@ -378,6 +382,8 @@ class PdfStudioBottomChrome extends StatelessWidget {
             onPages: onPages,
             onUndo: onUndo,
             onRedo: onRedo,
+            eraserActive: eraserActive,
+            onEraser: onEraser,
           ),
           const SizedBox(height: 7),
           Material(
@@ -436,6 +442,8 @@ class _QuickBar extends StatelessWidget {
     required this.onPages,
     required this.onUndo,
     required this.onRedo,
+    required this.eraserActive,
+    required this.onEraser,
   });
 
   final bool canUndo;
@@ -444,6 +452,8 @@ class _QuickBar extends StatelessWidget {
   final VoidCallback onPages;
   final VoidCallback onUndo;
   final VoidCallback onRedo;
+  final bool eraserActive;
+  final VoidCallback? onEraser;
 
   @override
   Widget build(BuildContext context) {
@@ -464,6 +474,14 @@ class _QuickBar extends StatelessWidget {
               label: 'أدوات',
               color: PdfStudioColors.violetText,
               onTap: onTools,
+            ),
+            _QuickAction(
+              icon: Icons.auto_fix_normal_rounded,
+              label: 'ممحاة',
+              color: eraserActive
+                  ? PdfStudioColors.yellow
+                  : PdfStudioColors.cyanText,
+              onTap: onEraser,
             ),
             _QuickAction(
               icon: Icons.grid_view_rounded,

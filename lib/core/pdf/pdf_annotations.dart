@@ -23,6 +23,7 @@ enum PdfAnnotationKind {
   image,
   stamp,
   arrow,
+  shape,
   audio,
   video;
 
@@ -33,6 +34,9 @@ enum PdfAnnotationKind {
   /// Whether this annotation owns a file outside the PDF.
   bool get hasMedia => this == image || this == audio || this == video;
 
+  /// Whether this annotation is a freehand stroke with stored points.
+  bool get isStroke => this == ink;
+
   /// The studio's default accent for this kind (ARGB).
   int get defaultColor => switch (this) {
         highlight => 0xFFFFD84D,
@@ -40,13 +44,79 @@ enum PdfAnnotationKind {
         strike => 0xFFE5484D,
         ink => 0xFF4779FF,
         note => 0xFFF5D45A,
-        text => 0xFFF2F6FF,
+        text => 0xFF08152E,
         image => 0xFF7C5CFF,
         stamp => 0xFF3DDC97,
         arrow => 0xFFF5D45A,
+        shape => 0xFF4779FF,
         audio => 0xFF7C5CFF,
         video => 0xFF35BCE8,
       };
+}
+
+/// Horizontal alignment for inserted text, independent of the document language.
+enum PdfTextAlign { left, center, right }
+
+/// The geometric shapes the studio can draw by dragging.
+enum PdfShapeKind { rectangle, ellipse, line }
+
+/// One normalized point on a page (0..1, origin at the unrotated top-left).
+///
+/// Strokes are stored as points rather than bitmaps so pen and highlighter
+/// stay sharp at any zoom, and so the eraser can compare the pointer against
+/// the actual path instead of a loose bounding box.
+class PdfPoint {
+  const PdfPoint(this.x, this.y);
+
+  final double x;
+  final double y;
+
+  PdfPoint clampToPage() => PdfPoint(
+        x.clamp(0.0, 1.0).toDouble(),
+        y.clamp(0.0, 1.0).toDouble(),
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is PdfPoint && other.x == x && other.y == y;
+
+  @override
+  int get hashCode => Object.hash(x, y);
+
+  @override
+  String toString() => 'PdfPoint($x, $y)';
+}
+
+/// The smallest rectangle containing [points], padded by [padding].
+///
+/// Returns null for an empty list; callers fall back to a default box.
+NormalizedRect? pdfBoundsOfPoints(
+  Iterable<PdfPoint> points, {
+  double padding = 0,
+}) {
+  double? left;
+  double? top;
+  double? right;
+  double? bottom;
+  for (final point in points) {
+    left = left == null ? point.x : math.min(left, point.x);
+    top = top == null ? point.y : math.min(top, point.y);
+    right = right == null ? point.x : math.max(right, point.x);
+    bottom = bottom == null ? point.y : math.max(bottom, point.y);
+  }
+  if (left == null || top == null || right == null || bottom == null) {
+    return null;
+  }
+  final l = (left - padding).clamp(0.0, 1.0).toDouble();
+  final t = (top - padding).clamp(0.0, 1.0).toDouble();
+  final r = (right + padding).clamp(0.0, 1.0).toDouble();
+  final b = (bottom + padding).clamp(0.0, 1.0).toDouble();
+  return NormalizedRect(
+    l,
+    t,
+    math.max(r - l, 0.001),
+    math.max(b - t, 0.001),
+  );
 }
 
 /// One coordinate-anchored annotation.
@@ -63,6 +133,11 @@ class PdfAnnotation {
     this.mediaName = '',
     this.mediaBytes = 0,
     this.durationMs = 0,
+    this.points = const [],
+    this.strokeWidth = 0,
+    this.fontScale = 0,
+    this.textAlign = PdfTextAlign.center,
+    this.shape = PdfShapeKind.rectangle,
     required this.createdAt,
   }) : color = color ?? 0;
 
@@ -95,10 +170,35 @@ class PdfAnnotation {
   /// Audio/video length, when the picker could not tell us (zero is fine).
   final int durationMs;
 
+  /// Freehand path in normalized page coordinates ([PdfAnnotationKind.ink]).
+  final List<PdfPoint> points;
+
+  /// Stroke width as a fraction of the page width; zero means the default.
+  final double strokeWidth;
+
+  /// Text size as a fraction of the page height; zero means the default.
+  final double fontScale;
+
+  /// Alignment for inserted text.
+  final PdfTextAlign textAlign;
+
+  /// Which geometry [PdfAnnotationKind.shape] draws.
+  final PdfShapeKind shape;
+
   final DateTime createdAt;
 
   /// The effective colour, falling back to the kind's accent.
   int get effectiveColor => color == 0 ? kind.defaultColor : color;
+
+  /// The stroke width to paint, in page-width fractions.
+  double get effectiveStrokeWidth => strokeWidth > 0 ? strokeWidth : 0.004;
+
+  /// The text size to paint, in page-height fractions.
+  double get effectiveFontScale => fontScale > 0 ? fontScale : 0.022;
+
+  /// The first and last stored point, for arrows drawn by dragging.
+  PdfPoint? get startPoint => points.isEmpty ? null : points.first;
+  PdfPoint? get endPoint => points.isEmpty ? null : points.last;
 
   PdfAnnotation copyWith({
     String? id,
@@ -112,6 +212,11 @@ class PdfAnnotation {
     String? mediaName,
     int? mediaBytes,
     int? durationMs,
+    List<PdfPoint>? points,
+    double? strokeWidth,
+    double? fontScale,
+    PdfTextAlign? textAlign,
+    PdfShapeKind? shape,
     DateTime? createdAt,
   }) {
     return PdfAnnotation(
@@ -126,6 +231,11 @@ class PdfAnnotation {
       mediaName: mediaName ?? this.mediaName,
       mediaBytes: mediaBytes ?? this.mediaBytes,
       durationMs: durationMs ?? this.durationMs,
+      points: points ?? this.points,
+      strokeWidth: strokeWidth ?? this.strokeWidth,
+      fontScale: fontScale ?? this.fontScale,
+      textAlign: textAlign ?? this.textAlign,
+      shape: shape ?? this.shape,
       createdAt: createdAt ?? this.createdAt,
     );
   }
@@ -164,6 +274,14 @@ class PdfAnnotation {
         if (mediaName.isNotEmpty) 'mediaName': mediaName,
         if (mediaBytes > 0) 'mediaBytes': mediaBytes,
         if (durationMs > 0) 'duration': durationMs,
+        if (points.isNotEmpty)
+          'points': [
+            for (final point in points) [point.x, point.y],
+          ],
+        if (strokeWidth > 0) 'strokeWidth': strokeWidth,
+        if (fontScale > 0) 'fontScale': fontScale,
+        if (textAlign != PdfTextAlign.center) 'align': textAlign.name,
+        if (shape != PdfShapeKind.rectangle) 'shape': shape.name,
         'createdAt': createdAt.toUtc().toIso8601String(),
       };
 
@@ -199,6 +317,22 @@ class PdfAnnotation {
     );
     final created = DateTime.tryParse(json['createdAt'] as String? ?? '') ??
         DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+    final rawPoints = json['points'];
+    final points = <PdfPoint>[];
+    if (rawPoints is List) {
+      for (final element in rawPoints) {
+        if (points.length >= 4096) break;
+        if (element is! List || element.length < 2) continue;
+        final x = element[0];
+        final y = element[1];
+        if (x is! num || y is! num) continue;
+        points.add(
+          PdfPoint(x.toDouble(), y.toDouble()).clampToPage(),
+        );
+      }
+    }
+    final align = json['align'];
+    final shape = json['shape'];
     return PdfAnnotation(
       id: id,
       pageIndex: math.max(0, page.toInt()),
@@ -218,6 +352,21 @@ class PdfAnnotation {
       mediaName: json['mediaName'] as String? ?? '',
       mediaBytes: (json['mediaBytes'] as num?)?.toInt() ?? 0,
       durationMs: (json['duration'] as num?)?.toInt() ?? 0,
+      points: points,
+      strokeWidth: ((json['strokeWidth'] as num?)?.toDouble() ?? 0)
+          .clamp(0.0, 0.08)
+          .toDouble(),
+      fontScale: ((json['fontScale'] as num?)?.toDouble() ?? 0)
+          .clamp(0.0, 0.25)
+          .toDouble(),
+      textAlign: PdfTextAlign.values.firstWhere(
+        (value) => value.name == align,
+        orElse: () => PdfTextAlign.center,
+      ),
+      shape: PdfShapeKind.values.firstWhere(
+        (value) => value.name == shape,
+        orElse: () => PdfShapeKind.rectangle,
+      ),
       createdAt: created,
     );
   }

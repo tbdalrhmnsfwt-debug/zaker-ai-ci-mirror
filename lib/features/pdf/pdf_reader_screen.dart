@@ -41,6 +41,7 @@ import '../../providers/app_providers.dart';
 import '../../providers/pdf_providers.dart';
 import '../../widgets/common.dart';
 import '../../widgets/tr_text.dart';
+import 'widgets/pdf_page_view.dart';
 import 'widgets/pdf_reader_viewport.dart';
 import 'widgets/pdf_search_sheet.dart';
 import 'widgets/pdf_settings_sheet.dart';
@@ -126,7 +127,40 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
   double _highlightOpacity = 0.55;
   bool _exporting = false;
 
+  // Live tool state. The eraser is not a [PdfAnnotationKind]: it removes what
+  // the other tools left behind, so it runs alongside them.
+  bool _eraserActive = false;
+  bool _eraserObjectMode = false;
+  int _eraserSize = 1;
+  PdfShapeKind _shapeKind = PdfShapeKind.rectangle;
+  int _inkColor = 0xFF1E88E5;
+  double _inkWidth = 0.004;
+  int _textColor = 0xFF08152E;
+  double _textScale = 0.024;
+  PdfTextAlign _textAlign = PdfTextAlign.center;
+  _StampPreset _stampPreset = _stampPresets.first;
+
+  /// The annotation list from before one eraser gesture, committed to undo when
+  /// the gesture ends and something was actually removed.
+  List<PdfAnnotation>? _eraseSnapshot;
+
+  /// The live text composer, when the text tool tapped a spot.
+  _TextDraft? _textDraft;
+
   static const int _undoLimit = 50;
+
+  static const List<double> _eraserRadii = [0.012, 0.024, 0.04];
+
+  static const List<_StampPreset> _stampPresets = [
+    _StampPreset('معتمد', 0xFF3DDC97),
+    _StampPreset('صحيح', 0xFF4779FF),
+    _StampPreset('مهم', 0xFFFFB020),
+    _StampPreset('سؤال', 0xFF7C5CFF),
+  ];
+
+  /// The eraser's touch radius as a fraction of the page width.
+  double get _eraserRadius =>
+      _eraserRadii[_eraserSize.clamp(0, _eraserRadii.length - 1).toInt()];
 
   @override
   void initState() {
@@ -149,6 +183,7 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
   void dispose() {
     _markTimer?.cancel();
     _zoomLabel.dispose();
+    _textDraft?.controller.dispose();
     if (widget.docId == null) {
       // Media belongs to annotations that are only in memory here; nothing
       // outside this screen can restore them, so they leave with it.
@@ -629,18 +664,35 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
     String? mediaPath,
     String mediaName = '',
     int mediaBytes = 0,
+    int durationMs = 0,
+    int color = 0,
+    double? opacity,
+    List<PdfPoint> points = const [],
+    double? strokeWidth,
+    double? fontScale,
+    PdfTextAlign? textAlign,
+    PdfShapeKind? shape,
   }) {
     final annotation = PdfAnnotation(
       id: id ?? _newAnnotationId(),
       pageIndex: pageIndex,
       kind: kind,
       rect: rect.clampToPage(),
-      color: kind == PdfAnnotationKind.highlight ? _highlightColor : 0,
-      opacity: kind == PdfAnnotationKind.highlight ? _highlightOpacity : 1,
+      color: color != 0
+          ? color
+          : (kind == PdfAnnotationKind.highlight ? _highlightColor : 0),
+      opacity: opacity ??
+          (kind == PdfAnnotationKind.highlight ? _highlightOpacity : 1),
       text: text,
       mediaPath: mediaPath,
       mediaName: mediaName,
       mediaBytes: mediaBytes,
+      durationMs: durationMs,
+      points: points,
+      strokeWidth: strokeWidth ?? 0,
+      fontScale: fontScale ?? 0,
+      textAlign: textAlign ?? PdfTextAlign.center,
+      shape: shape ?? PdfShapeKind.rectangle,
       createdAt: DateTime.now(),
     );
     _setAnnotations([..._annotations, annotation]);
@@ -665,6 +717,7 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
       PdfAnnotationKind.image => (0.36, 0.22),
       PdfAnnotationKind.stamp => (0.22, 0.055),
       PdfAnnotationKind.arrow => (0.28, 0.12),
+      PdfAnnotationKind.shape => (0.28, 0.16),
       PdfAnnotationKind.audio => (0.42, 0.075),
       PdfAnnotationKind.video => (0.46, 0.11),
     };
@@ -725,6 +778,13 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
       case PdfAnnotationKind.audio:
       case PdfAnnotationKind.video:
         await _insertMedia(kind, pageIndex, rect);
+      case PdfAnnotationKind.shape:
+        _addAnnotation(
+          pageIndex: pageIndex,
+          kind: kind,
+          rect: rect,
+          shape: _shapeKind,
+        );
       case PdfAnnotationKind.highlight:
       case PdfAnnotationKind.underline:
       case PdfAnnotationKind.strike:
@@ -822,8 +882,50 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
       mediaPath: target.path,
       mediaName: file.name,
       mediaBytes: bytes.length,
+      durationMs: kind == PdfAnnotationKind.video ? _videoDurationMs(bytes) : 0,
     );
   }
+
+  /// Reads the duration from an MP4/MOV `mvhd` box without a media dependency.
+  ///
+  /// Only the timeline header is needed: the player itself lives outside the
+  /// app, but the card can still show a real length. Unknown containers return
+  /// zero, which the card renders as no duration.
+  static int _videoDurationMs(Uint8List bytes) {
+    for (var i = 0; i + 24 < bytes.length; i++) {
+      if (bytes[i] != 0x6D || // m
+          bytes[i + 1] != 0x76 || // v
+          bytes[i + 2] != 0x68 || // h
+          bytes[i + 3] != 0x64) {
+        continue;
+      }
+      final data = i + 4;
+      try {
+        if (bytes[data] == 1) {
+          final timescale = _u32(bytes, data + 16);
+          final duration = _u64(bytes, data + 20);
+          if (timescale == 0 || duration <= 0) return 0;
+          return (duration * 1000 / timescale).round();
+        }
+        final timescale = _u32(bytes, data + 8);
+        final duration = _u32(bytes, data + 12);
+        if (timescale == 0 || duration <= 0) return 0;
+        return (duration * 1000 / timescale).round();
+      } on RangeError {
+        return 0;
+      }
+    }
+    return 0;
+  }
+
+  static int _u32(Uint8List bytes, int offset) =>
+      (bytes[offset] << 24) |
+      (bytes[offset + 1] << 16) |
+      (bytes[offset + 2] << 8) |
+      bytes[offset + 3];
+
+  static int _u64(Uint8List bytes, int offset) =>
+      (_u32(bytes, offset) << 32) | _u32(bytes, offset + 4);
 
   static String _extensionOf(String name) {
     final dot = name.lastIndexOf('.');
@@ -834,15 +936,7 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
 
   Future<void> _editAnnotation(PdfAnnotation annotation) async {
     if (annotation.kind.hasMedia) {
-      final path = annotation.mediaPath;
-      if (path == null || !File(path).existsSync()) {
-        _toast('الملف المرفق مش موجود.');
-        return;
-      }
-      await Share.shareXFiles(
-        [XFile(path)],
-        subject: annotation.mediaName,
-      );
+      await _openMedia(annotation);
       return;
     }
     final canEditText = annotation.kind == PdfAnnotationKind.note ||
@@ -904,12 +998,625 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
     ]);
   }
 
+  // ------------------------------------------------------------ interaction
+
+  /// The tool the pages should apply to touches right now.
+  PdfPageTool get _pageTool {
+    if (_eraserActive) {
+      return _eraserObjectMode
+          ? PdfPageTool.eraseObject
+          : PdfPageTool.eraseStroke;
+    }
+    return switch (_activeKind) {
+      PdfAnnotationKind.ink => PdfPageTool.ink,
+      PdfAnnotationKind.highlight => PdfPageTool.highlight,
+      PdfAnnotationKind.underline => PdfPageTool.underline,
+      PdfAnnotationKind.strike => PdfPageTool.strike,
+      PdfAnnotationKind.arrow => PdfPageTool.arrow,
+      PdfAnnotationKind.shape => PdfPageTool.shape,
+      PdfAnnotationKind.image => PdfPageTool.image,
+      PdfAnnotationKind.text => PdfPageTool.text,
+      PdfAnnotationKind.stamp => PdfPageTool.stamp,
+      _ => PdfPageTool.none,
+    };
+  }
+
+  int get _toolColor {
+    if (_eraserActive) return 0xFF8A94A6;
+    return switch (_activeKind) {
+      PdfAnnotationKind.highlight => _highlightColor,
+      PdfAnnotationKind.ink => _inkColor,
+      PdfAnnotationKind.arrow => 0xFFFFB020,
+      _ => 0xFF4779FF,
+    };
+  }
+
+  double get _toolOpacity =>
+      _activeKind == PdfAnnotationKind.highlight ? _highlightOpacity : 1;
+
+  double get _toolStrokeWidth =>
+      _activeKind == PdfAnnotationKind.ink ? _inkWidth : 0.004;
+
+  void _onStrokeEnd(int pageIndex, List<PdfPoint> points) {
+    final kind = _activeKind;
+    if (_eraserActive || kind == null || points.length < 2) return;
+    if (kind == PdfAnnotationKind.ink) {
+      final bounds = pdfBoundsOfPoints(points, padding: _inkWidth * 0.5);
+      if (bounds == null) return;
+      _addAnnotation(
+        pageIndex: pageIndex,
+        kind: kind,
+        rect: bounds,
+        points: List<PdfPoint>.unmodifiable(points),
+        color: _inkColor,
+        strokeWidth: _inkWidth,
+      );
+      return;
+    }
+    if (kind == PdfAnnotationKind.highlight ||
+        kind == PdfAnnotationKind.underline ||
+        kind == PdfAnnotationKind.strike) {
+      final bounds = _bandBounds(points);
+      if (bounds == null) return;
+      _addAnnotation(pageIndex: pageIndex, kind: kind, rect: bounds);
+    }
+  }
+
+  /// The band a marker drag covers, with a floor so a straight swipe over one
+  /// line stays visible.
+  NormalizedRect? _bandBounds(List<PdfPoint> points) {
+    final raw = pdfBoundsOfPoints(points, padding: 0.006);
+    if (raw == null) return null;
+    return NormalizedRect(
+      raw.left,
+      raw.top,
+      max(raw.width, 0.02),
+      max(raw.height, 0.02),
+    ).clampToPage();
+  }
+
+  void _onRectDrag(int pageIndex, PdfPoint start, PdfPoint end) {
+    final kind = _activeKind;
+    if (_eraserActive || kind == null) return;
+    final bounds = pdfBoundsOfPoints([start, end], padding: 0.004);
+    if (bounds == null) return;
+    final rect = NormalizedRect(
+      bounds.left,
+      bounds.top,
+      max(bounds.width, 0.02),
+      max(bounds.height, 0.02),
+    ).clampToPage();
+    switch (kind) {
+      case PdfAnnotationKind.arrow:
+        _addAnnotation(
+          pageIndex: pageIndex,
+          kind: kind,
+          rect: rect,
+          points: [start, end],
+          color: 0xFFFFB020,
+        );
+      case PdfAnnotationKind.shape:
+        _addAnnotation(
+          pageIndex: pageIndex,
+          kind: kind,
+          rect: rect,
+          points: [start, end],
+          shape: _shapeKind,
+        );
+      case PdfAnnotationKind.image:
+        unawaited(_insertMedia(kind, pageIndex, rect));
+      default:
+        break;
+    }
+  }
+
+  Future<void> _onPageTap(int pageIndex, PdfPoint point) async {
+    if (_eraserActive) {
+      _eraseObjectAt(pageIndex, point);
+      return;
+    }
+    final kind = _activeKind;
+    if (kind == PdfAnnotationKind.text) {
+      _beginTextDraft(pageIndex, point);
+    } else if (kind == PdfAnnotationKind.stamp) {
+      _placeStamp(pageIndex, point);
+    }
+  }
+
+  void _beginTextDraft(int pageIndex, PdfPoint point) {
+    final previous = _textDraft;
+    setState(() {
+      _textDraft = _TextDraft(
+        pageIndex: pageIndex,
+        point: point,
+        controller: TextEditingController(),
+      );
+    });
+    if (previous != null) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => previous.controller.dispose(),
+      );
+    }
+  }
+
+  void _cancelTextDraft() {
+    final draft = _textDraft;
+    if (draft == null) return;
+    setState(() => _textDraft = null);
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => draft.controller.dispose(),
+    );
+  }
+
+  void _commitTextDraft() {
+    final draft = _textDraft;
+    if (draft == null) return;
+    final text = draft.controller.text.trim();
+    if (text.isEmpty) {
+      _toast('اكتب النص الأول.');
+      return;
+    }
+    const width = 0.46;
+    final height = (0.05 + _textScale * 2.4).clamp(0.06, 0.24).toDouble();
+    final left = (draft.point.x - width / 2).clamp(0.0, 1 - width).toDouble();
+    final top = (draft.point.y - height / 2).clamp(0.0, 1 - height).toDouble();
+    _addAnnotation(
+      pageIndex: draft.pageIndex,
+      kind: PdfAnnotationKind.text,
+      rect: NormalizedRect(left, top, width, height),
+      text: text,
+      color: _textColor,
+      fontScale: _textScale,
+      textAlign: _textAlign,
+    );
+    setState(() => _textDraft = null);
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => draft.controller.dispose(),
+    );
+  }
+
+  void _placeStamp(int pageIndex, PdfPoint point) {
+    const width = 0.24;
+    const height = 0.06;
+    final left = (point.x - width / 2).clamp(0.0, 1 - width).toDouble();
+    final top = (point.y - height / 2).clamp(0.0, 1 - height).toDouble();
+    _addAnnotation(
+      pageIndex: pageIndex,
+      kind: PdfAnnotationKind.stamp,
+      rect: NormalizedRect(left, top, width, height),
+      text: _stampPreset.label,
+      color: _stampPreset.color,
+    );
+    _toast('تم وضع ختم «${_stampPreset.label}».');
+  }
+
+  void _setEraserActive(bool active) {
+    setState(() {
+      _eraserActive = active;
+      if (active) {
+        _activeKind = null;
+      } else {
+        _eraserObjectMode = false;
+      }
+    });
+    if (active && mounted) {
+      _toast(
+        _eraserObjectMode
+            ? 'ممحاة العناصر: اضغط على العنصر نفسه لمسحه.'
+            : 'ممحاة الرسم: مرّر على الرسم أو التظليل لمسحه.',
+      );
+    }
+  }
+
+  void _onEraseStart(int pageIndex) {
+    _eraseSnapshot = _annotations;
+  }
+
+  void _onErasePoint(int pageIndex, PdfPoint point) {
+    if (!_eraserActive || _eraserObjectMode) return;
+    final radius = _eraserRadius;
+    final kept = <PdfAnnotation>[];
+    var changed = false;
+    for (final annotation in _annotations) {
+      if (annotation.pageIndex == pageIndex &&
+          annotation.kind.isMark &&
+          _touchHits(annotation, point, radius)) {
+        changed = true;
+        continue;
+      }
+      kept.add(annotation);
+    }
+    if (!changed) return;
+    setState(() => _annotations = kept);
+  }
+
+  void _onEraseEnd(int pageIndex) {
+    final snapshot = _eraseSnapshot;
+    _eraseSnapshot = null;
+    if (snapshot == null || identical(snapshot, _annotations)) return;
+    _undoStack.add(snapshot);
+    if (_undoStack.length > _undoLimit) _undoStack.removeAt(0);
+    _redoStack.clear();
+    _persistAnnotations();
+    // The chrome reads the stack sizes for its undo/redo state.
+    setState(() {});
+  }
+
+  /// Removes the topmost annotation under [point], for the object eraser.
+  void _eraseObjectAt(int pageIndex, PdfPoint point) {
+    for (var i = _annotations.length - 1; i >= 0; i--) {
+      final annotation = _annotations[i];
+      if (annotation.pageIndex != pageIndex) continue;
+      final hit = annotation.kind.isMark
+          ? _touchHits(annotation, point, max(_eraserRadius, 0.012))
+          : _rectContains(annotation.rect, point);
+      if (!hit) continue;
+      _removeAnnotation(annotation);
+      _toast('تم مسح ${_annotationKindLabel(annotation.kind)}.');
+      return;
+    }
+    _toast('مفيش عنصر هنا. اضغط على العنصر نفسه.');
+  }
+
+  static bool _rectContains(NormalizedRect rect, PdfPoint point) =>
+      point.x >= rect.left &&
+      point.x <= rect.right &&
+      point.y >= rect.top &&
+      point.y <= rect.bottom;
+
+  /// Whether [point] lands within [radius] of [annotation].
+  static bool _touchHits(
+    PdfAnnotation annotation,
+    PdfPoint point,
+    double radius,
+  ) {
+    final rect = annotation.rect;
+    if (point.x < rect.left - radius ||
+        point.x > rect.right + radius ||
+        point.y < rect.top - radius ||
+        point.y > rect.bottom + radius) {
+      return false;
+    }
+    if (annotation.kind != PdfAnnotationKind.ink ||
+        annotation.points.length < 2) {
+      return true;
+    }
+    final threshold = radius + annotation.effectiveStrokeWidth / 2;
+    for (var i = 1; i < annotation.points.length; i++) {
+      if (_distanceToSegment(
+            point,
+            annotation.points[i - 1],
+            annotation.points[i],
+          ) <=
+          threshold) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static double _distanceToSegment(PdfPoint point, PdfPoint a, PdfPoint b) {
+    final dx = b.x - a.x;
+    final dy = b.y - a.y;
+    final lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared <= 1e-9) return _distance(point, a);
+    final t = (((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared)
+        .clamp(0.0, 1.0);
+    return _distance(point, PdfPoint(a.x + t * dx, a.y + t * dy));
+  }
+
+  static double _distance(PdfPoint a, PdfPoint b) =>
+      sqrt(pow(a.x - b.x, 2) + pow(a.y - b.y, 2));
+
+  Future<void> _clearPageAnnotations() async {
+    final page = _page;
+    final count = _annotations.where((a) => a.pageIndex == page).length;
+    if (count == 0) {
+      _toast('مفيش تعليقات على الصفحة دي.');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const TrText('مسح تعليقات الصفحة'),
+        content: TrText(
+          'هيتم مسح $count تعليقًا من صفحة ${page + 1}. تقدر ترجّعهم بالتراجع.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const TrText('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: PdfStudioColors.pdfRed,
+            ),
+            child: const TrText('امسح'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    _setAnnotations([
+      for (final annotation in _annotations)
+        if (annotation.pageIndex != page) annotation,
+    ]);
+    _toast('تم مسح $count تعليقًا من الصفحة ${page + 1}.');
+  }
+
+  Future<void> _openStampPicker() async {
+    final picked = await PdfStudioTheme.showSheet<int>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const TrText(
+                'ملصق أو ختم',
+                style: TextStyle(
+                  color: PdfStudioColors.text,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 4),
+              const TrText(
+                'اختر ختمًا، وبعدها اضغط على مكانه في الصفحة.',
+                style: TextStyle(
+                  color: PdfStudioColors.muted,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  for (var i = 0; i < _stampPresets.length; i++)
+                    Material(
+                      color: PdfStudioColors.surfaceAlt,
+                      borderRadius: BorderRadius.circular(14),
+                      child: InkWell(
+                        onTap: () => Navigator.of(sheetContext).pop(i),
+                        borderRadius: BorderRadius.circular(14),
+                        child: Container(
+                          width: 132,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 14,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(
+                              color: Color(
+                                _stampPresets[i].color | 0xFF000000,
+                              ).withValues(alpha: 0.65),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.verified_rounded,
+                                size: 18,
+                                color: Color(
+                                  _stampPresets[i].color | 0xFF000000,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: TrText(
+                                  _stampPresets[i].label,
+                                  style: const TextStyle(
+                                    color: PdfStudioColors.text,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              _StudioMenuTile(
+                icon: Icons.add_photo_alternate_outlined,
+                label: 'صورة مخصصة',
+                onTap: () => Navigator.of(sheetContext).pop(-1),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!mounted || picked == null) return;
+    if (picked < 0) {
+      setState(() {
+        _activeKind = PdfAnnotationKind.image;
+        _eraserActive = false;
+      });
+      _toast('اسحب مستطيل مكان الصورة في الصفحة.');
+      return;
+    }
+    setState(() {
+      _activeKind = PdfAnnotationKind.stamp;
+      _eraserActive = false;
+      _stampPreset =
+          _stampPresets[picked.clamp(0, _stampPresets.length - 1).toInt()];
+    });
+    _toast('اضغط على الصفحة لوضع «${_stampPreset.label}».');
+  }
+
+  Future<void> _insertNotebookPage() async {
+    final choice = await showDialog<_NotebookChoice>(
+      context: context,
+      builder: (dialogContext) => const _NotebookDialog(),
+    );
+    if (choice == null || !mounted) return;
+    _toast('بنجهّز الصفحة المسطرة…');
+    try {
+      final bytes = const PdfExportManager().buildNotebookPdf(
+        style: choice.style,
+        pageCount: choice.pageCount,
+      );
+      final name = 'notebook-${DateTime.now().millisecondsSinceEpoch}.pdf';
+      final file = await _writeExport(name, bytes);
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => PdfReaderScreen(
+            path: file.path,
+            title: 'صفحة مسطرة',
+            fileName: name,
+          ),
+        ),
+      );
+    } on Object {
+      if (mounted) _toast('مقدرناش نجهّز الصفحة المسطرة.');
+    }
+  }
+
+  Future<void> _openMedia(PdfAnnotation annotation) async {
+    final path = annotation.mediaPath;
+    if (path == null || !File(path).existsSync()) {
+      _toast('الملف المرفق مش موجود.');
+      return;
+    }
+    final isImage = annotation.kind == PdfAnnotationKind.image;
+    final isVideo = annotation.kind == PdfAnnotationKind.video;
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: TrText(_annotationKindLabel(annotation.kind)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (isImage)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.file(
+                  File(path),
+                  height: 150,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                ),
+              )
+            else
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    isVideo
+                        ? Icons.play_circle_fill_rounded
+                        : Icons.graphic_eq_rounded,
+                    size: 42,
+                    color: PdfStudioColors.cyanText,
+                  ),
+                  if (annotation.durationMs > 0) ...[
+                    const SizedBox(width: 10),
+                    TrText(_formatDuration(annotation.durationMs)),
+                  ],
+                ],
+              ),
+            const SizedBox(height: 10),
+            TrText('الملف: ${annotation.mediaName}'),
+            if (!isImage) ...[
+              const SizedBox(height: 6),
+              const TrText(
+                'التشغيل بيتم في مشغل الجهاز لأن القارئ مش بيضم مشغل فيديو.',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: PdfStudioColors.muted,
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const TrText('إغلاق'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop('delete'),
+            style: TextButton.styleFrom(
+              foregroundColor: PdfStudioColors.pdfRed,
+            ),
+            child: const TrText('حذف'),
+          ),
+          if (!isImage)
+            FilledButton.icon(
+              onPressed: () => Navigator.of(dialogContext).pop('open'),
+              icon: const Icon(Icons.open_in_new_rounded, size: 18),
+              label: const TrText('فتح'),
+            ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'delete') {
+      _removeAnnotation(annotation);
+      return;
+    }
+    if (action == 'open') {
+      await Share.shareXFiles([XFile(path)], subject: annotation.mediaName);
+    }
+  }
+
+  static String _formatDuration(int milliseconds) {
+    final total = (milliseconds / 1000).round();
+    final minutes = total ~/ 60;
+    final seconds = (total % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  String get _hintMessage {
+    if (_eraserActive) {
+      return _eraserObjectMode
+          ? 'اضغط على أي عنصر في الصفحة عشان تمسحه.'
+          : 'مرّر الممحاة على الرسم أو التظليل عشان تمسحه.';
+    }
+    final kind = _activeKind;
+    if (kind == null) return '';
+    return switch (kind) {
+      PdfAnnotationKind.ink => 'ارسم بإصبعك على الصفحة.',
+      PdfAnnotationKind.highlight ||
+      PdfAnnotationKind.underline ||
+      PdfAnnotationKind.strike =>
+        'اسحب على السطر عشان تحدّد ${_kindNoun(kind)}.',
+      PdfAnnotationKind.arrow => 'اسحب من بداية السهم لنهايته.',
+      PdfAnnotationKind.shape =>
+        'اسحب على الصفحة لرسم ${_shapeNoun(_shapeKind)}.',
+      PdfAnnotationKind.image => 'اسحب مستطيل مكان الصورة.',
+      PdfAnnotationKind.text => 'اضغط على مكان النص عشان تكتبه.',
+      PdfAnnotationKind.stamp => 'اضغط على مكان الختم «${_stampPreset.label}».',
+      _ => 'اضغط مطوّل على مكان ${_kindNoun(kind)} في الصفحة.',
+    };
+  }
+
+  static String _shapeNoun(PdfShapeKind shape) => switch (shape) {
+        PdfShapeKind.rectangle => 'مستطيل',
+        PdfShapeKind.ellipse => 'دائرة',
+        PdfShapeKind.line => 'خط',
+      };
+
   Future<void> _openTools() async {
     PdfStudioAction? pending;
     await showPdfToolsSheet(
       context,
       activeKind: _activeKind,
-      onKind: (kind) => setState(() => _activeKind = kind),
+      onKind: (kind) => setState(() {
+        _activeKind = kind;
+        if (kind != null) _eraserActive = false;
+      }),
       onAction: (action) {
         pending = action;
         Navigator.of(context).maybePop();
@@ -922,6 +1629,24 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
       highlightOpacity: _highlightOpacity,
       onHighlightColor: (value) => setState(() => _highlightColor = value),
       onHighlightOpacity: (value) => setState(() => _highlightOpacity = value),
+      eraserActive: _eraserActive,
+      eraserObjectMode: _eraserObjectMode,
+      eraserSize: _eraserSize,
+      onEraser: (value) => setState(() {
+        _eraserActive = value;
+        if (value) {
+          _activeKind = null;
+        } else {
+          _eraserObjectMode = false;
+        }
+      }),
+      onEraserObjectMode: (value) => setState(() {
+        _eraserObjectMode = value;
+        if (value) _eraserActive = true;
+      }),
+      onEraserSize: (value) => setState(() => _eraserSize = value),
+      shape: _shapeKind,
+      onShape: (value) => setState(() => _shapeKind = value),
     );
     if (!mounted || pending == null) return;
     await _runToolAction(pending!);
@@ -935,6 +1660,8 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
         _activateTool(PdfAnnotationKind.image);
       case PdfStudioAction.stamp:
         _activateTool(PdfAnnotationKind.stamp);
+      case PdfStudioAction.stampPicker:
+        await _openStampPicker();
       case PdfStudioAction.note:
         _activateTool(PdfAnnotationKind.note);
       case PdfStudioAction.arrow:
@@ -945,6 +1672,10 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
         _activateTool(PdfAnnotationKind.video);
       case PdfStudioAction.pages:
         _openPageGrid();
+      case PdfStudioAction.notebook:
+        await _insertNotebookPage();
+      case PdfStudioAction.clearPage:
+        await _clearPageAnnotations();
       case PdfStudioAction.search:
         await _openSearch();
       case PdfStudioAction.compress:
@@ -962,8 +1693,11 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
   }
 
   void _activateTool(PdfAnnotationKind kind) {
-    setState(() => _activeKind = kind);
-    _toast('اضغط مطوّل على مكان ${_kindNoun(kind)} في الصفحة.');
+    setState(() {
+      _activeKind = kind;
+      _eraserActive = false;
+    });
+    _toast(_hintMessage);
   }
 
   void _openPageGrid() {
@@ -1221,9 +1955,6 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
     }
   }
 
-  String _hintFor(PdfAnnotationKind kind) =>
-      'اضغط مطوّل على مكان ${_kindNoun(kind)} في الصفحة.';
-
   static String _kindNoun(PdfAnnotationKind kind) => switch (kind) {
         PdfAnnotationKind.highlight => 'التظليل',
         PdfAnnotationKind.underline => 'التسطير',
@@ -1234,6 +1965,7 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
         PdfAnnotationKind.image => 'الصورة',
         PdfAnnotationKind.stamp => 'الختم',
         PdfAnnotationKind.arrow => 'السهم',
+        PdfAnnotationKind.shape => 'الشكل',
         PdfAnnotationKind.audio => 'المقطع الصوتي',
         PdfAnnotationKind.video => 'الفيديو',
       };
@@ -1248,6 +1980,7 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
         PdfAnnotationKind.image => 'صورة',
         PdfAnnotationKind.stamp => 'ختم',
         PdfAnnotationKind.arrow => 'سهم',
+        PdfAnnotationKind.shape => 'شكل',
         PdfAnnotationKind.audio => 'مقطع صوتي',
         PdfAnnotationKind.video => 'فيديو',
       };
@@ -1358,17 +2091,36 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
                       onPages: _openPageGrid,
                       onUndo: _undoAnnotation,
                       onRedo: _redoAnnotation,
+                      eraserActive: _eraserActive,
+                      onEraser: () => _setEraserActive(!_eraserActive),
                     ),
                   ),
                 ),
-              if (_chromeVisible && _activeKind != null)
+              if (_chromeVisible && (_eraserActive || _activeKind != null))
                 Positioned(
                   top: MediaQuery.paddingOf(context).top + 112,
                   left: 16,
                   right: 16,
                   child: PdfStudioHintBanner(
-                    message: _hintFor(_activeKind!),
-                    onClose: () => setState(() => _activeKind = null),
+                    message: _hintMessage,
+                    onClose: () => setState(() {
+                      _activeKind = null;
+                      _eraserActive = false;
+                    }),
+                  ),
+                ),
+              if (_textDraft != null)
+                Positioned.fill(
+                  child: _TextComposer(
+                    controller: _textDraft!.controller,
+                    color: _textColor,
+                    scale: _textScale,
+                    align: _textAlign,
+                    onColor: (value) => setState(() => _textColor = value),
+                    onScale: (value) => setState(() => _textScale = value),
+                    onAlign: (value) => setState(() => _textAlign = value),
+                    onCancel: _cancelTextDraft,
+                    onAdd: _commitTextDraft,
                   ),
                 ),
             ],
@@ -1457,8 +2209,23 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
           annotations: _annotations,
           onPageLongPress: (page, point) =>
               unawaited(_onPageLongPress(page, point)),
-          onAnnotationTap: (annotation) =>
-              unawaited(_editAnnotation(annotation)),
+          // With the object eraser active, a tap must reach the page instead of
+          // opening the annotation it landed on.
+          onAnnotationTap: _eraserActive
+              ? null
+              : (annotation) => unawaited(_editAnnotation(annotation)),
+          pageTool: _pageTool,
+          toolColor: _toolColor,
+          toolOpacity: _toolOpacity,
+          toolStrokeWidth: _toolStrokeWidth,
+          eraserRadius: _eraserRadius,
+          toolShape: _shapeKind,
+          onStrokeEnd: _onStrokeEnd,
+          onRectDrag: _onRectDrag,
+          onTapPoint: (page, point) => unawaited(_onPageTap(page, point)),
+          onErasePoint: _onErasePoint,
+          onEraseStart: _onEraseStart,
+          onEraseEnd: _onEraseEnd,
         ),
       ),
     );
@@ -1475,6 +2242,331 @@ class _PdfReaderScreenState extends ConsumerState<PdfReaderScreen> {
       PdfRenderFailure.storage => 'مفيش مساحة كافية على الجهاز.',
       _ => 'الملف تالف أو مش مقروء.',
     };
+  }
+}
+
+/// A built-in stamp the reader can drop on a page.
+class _StampPreset {
+  const _StampPreset(this.label, this.color);
+
+  final String label;
+  final int color;
+}
+
+/// The text composer's anchor and live controller.
+class _TextDraft {
+  _TextDraft({
+    required this.pageIndex,
+    required this.point,
+    required this.controller,
+  });
+
+  final int pageIndex;
+  final PdfPoint point;
+  final TextEditingController controller;
+}
+
+/// The live text editor shown while the text tool has a tapped spot.
+///
+/// The controller belongs to the reader, so colour, size and alignment edits
+/// rebuild this card without recreating the field or losing the cursor.
+class _TextComposer extends StatelessWidget {
+  const _TextComposer({
+    required this.controller,
+    required this.color,
+    required this.scale,
+    required this.align,
+    required this.onColor,
+    required this.onScale,
+    required this.onAlign,
+    required this.onCancel,
+    required this.onAdd,
+  });
+
+  final TextEditingController controller;
+  final int color;
+  final double scale;
+  final PdfTextAlign align;
+  final ValueChanged<int> onColor;
+  final ValueChanged<double> onScale;
+  final ValueChanged<PdfTextAlign> onAlign;
+  final VoidCallback onCancel;
+  final VoidCallback onAdd;
+
+  static const List<int> _colors = [
+    0xFF08152E,
+    0xFF4779FF,
+    0xFFE5484D,
+    0xFF2E9E5B,
+    0xFFFFB020,
+  ];
+  static const List<double> _sizes = [0.016, 0.024, 0.034];
+
+  Widget _chip(String label, bool selected, VoidCallback onTap) {
+    return Material(
+      color: selected
+          ? PdfStudioColors.cyanText.withValues(alpha: 0.18)
+          : PdfStudioColors.surfaceAlt,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color:
+                  selected ? PdfStudioColors.cyanText : PdfStudioColors.stroke,
+            ),
+          ),
+          child: TrText(
+            label,
+            style: TextStyle(
+              color: selected ? PdfStudioColors.cyanText : PdfStudioColors.text,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xCC000712),
+      child: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 430),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: PdfStudioColors.surface,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: PdfStudioColors.stroke),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const TrText(
+                      'إضافة نص',
+                      style: TextStyle(
+                        color: PdfStudioColors.text,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: controller,
+                      autofocus: true,
+                      minLines: 1,
+                      maxLines: 4,
+                      textDirection: TextDirection.rtl,
+                      textAlign: switch (align) {
+                        PdfTextAlign.left => TextAlign.left,
+                        PdfTextAlign.center => TextAlign.center,
+                        PdfTextAlign.right => TextAlign.right,
+                      },
+                      style: TextStyle(
+                        color: Color(color | 0xFF000000),
+                        fontSize: (scale * 800).clamp(12.0, 34.0),
+                        fontWeight: FontWeight.w600,
+                      ),
+                      decoration: InputDecoration(
+                        hintText: 'اكتب النص هنا',
+                        filled: true,
+                        fillColor: PdfStudioColors.surfaceAlt,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    const TrText(
+                      'الحجم',
+                      style: TextStyle(
+                        color: PdfStudioColors.muted,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (var i = 0; i < _sizes.length; i++)
+                          _chip(
+                            ['صغير', 'متوسط', 'كبير'][i],
+                            (scale - _sizes[i]).abs() < 0.001,
+                            () => onScale(_sizes[i]),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    const TrText(
+                      'اللون',
+                      style: TextStyle(
+                        color: PdfStudioColors.muted,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        for (final value in _colors)
+                          GestureDetector(
+                            onTap: () => onColor(value),
+                            child: Container(
+                              width: 28,
+                              height: 28,
+                              margin: const EdgeInsetsDirectional.only(end: 9),
+                              decoration: BoxDecoration(
+                                color: Color(value | 0xFF000000),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: value == color
+                                      ? Colors.white
+                                      : Colors.transparent,
+                                  width: 2,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    const TrText(
+                      'المحاذاة',
+                      style: TextStyle(
+                        color: PdfStudioColors.muted,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _chip('يمين', align == PdfTextAlign.right,
+                            () => onAlign(PdfTextAlign.right)),
+                        _chip('وسط', align == PdfTextAlign.center,
+                            () => onAlign(PdfTextAlign.center)),
+                        _chip('يسار', align == PdfTextAlign.left,
+                            () => onAlign(PdfTextAlign.left)),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    Row(
+                      children: [
+                        TextButton(
+                          onPressed: onCancel,
+                          child: const TrText('إلغاء'),
+                        ),
+                        const Spacer(),
+                        FilledButton.icon(
+                          onPressed: onAdd,
+                          icon: const Icon(Icons.check_rounded, size: 18),
+                          label: const TrText('إضافة'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NotebookChoice {
+  const _NotebookChoice(this.style, this.pageCount);
+
+  final PdfNotebookStyle style;
+  final int pageCount;
+}
+
+/// Picks the paper style and page count for a generated notebook.
+class _NotebookDialog extends StatefulWidget {
+  const _NotebookDialog();
+
+  @override
+  State<_NotebookDialog> createState() => _NotebookDialogState();
+}
+
+class _NotebookDialogState extends State<_NotebookDialog> {
+  PdfNotebookStyle _style = PdfNotebookStyle.ruled;
+  int _pages = 1;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const TrText('صفحة بيضاء مسطرة'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const TrText(
+            'اختر شكل الصفحة، وبعدها اكتب أو ارسم عليها بكل أدوات الاستوديو.',
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final style in PdfNotebookStyle.values)
+                ChoiceChip(
+                  label: TrText(style.labelAr),
+                  selected: _style == style,
+                  onSelected: (_) => setState(() => _style = style),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const TrText('عدد الصفحات'),
+              const Spacer(),
+              IconButton(
+                onPressed:
+                    _pages > 1 ? () => setState(() => _pages -= 1) : null,
+                icon: const Icon(Icons.remove_circle_outline_rounded),
+              ),
+              TrText('$_pages'),
+              IconButton(
+                onPressed:
+                    _pages < 20 ? () => setState(() => _pages += 1) : null,
+                icon: const Icon(Icons.add_circle_outline_rounded),
+              ),
+            ],
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const TrText('إلغاء'),
+        ),
+        FilledButton(
+          onPressed: () =>
+              Navigator.of(context).pop(_NotebookChoice(_style, _pages)),
+          child: const TrText('إنشاء'),
+        ),
+      ],
+    );
   }
 }
 
